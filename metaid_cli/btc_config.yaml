@@ -1,0 +1,14 @@
+chain: btc
+network: testnet
+wallet_file: btc_wallet.json
+paths:
+    - /info/name
+    - /info/avatar
+    - /info/name
+    - /protocols/simplenote
+rpc:
+    host: 127.0.0.1
+    port: 18443
+    user: test
+    password: test
+    use_tls: false

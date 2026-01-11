@@ -1,0 +1,6 @@
+man_base_data_pebble/
+manindexer
+.vscode/
+metaid_cli/metaid-cli
+idaddress/idaddress.test
+idaddress/cmd/idaddr/idaddr
