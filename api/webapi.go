@@ -88,11 +88,16 @@ func Start(f embed.FS) {
 		"formatAddress":  formatAddress,
 		"formatTime":     formatTime,
 		"outpointToTxId": outpointToTxId,
+		"add": func(a, b, c int) int {
+			return a + b + c
+		},
 	}
 	//use embed.FS
 	fp, _ := fs.Sub(f, "web/static")
 	r.StaticFS("/assets", http.FS(fp))
-	tmpl := template.Must(template.New("").Funcs(funcMap).ParseFS(f, "web/template/**/*"))
+	// Go's embed.FS and ParseFS don't support ** glob patterns
+	// Must specify each subdirectory explicitly
+	tmpl := template.Must(template.New("").Funcs(funcMap).ParseFS(f, "web/template/home/*.html", "web/template/public/*.html"))
 	r.SetHTMLTemplate(tmpl)
 	config := cors.DefaultConfig()
 	config.AllowOrigins = []string{"*"}
@@ -115,15 +120,18 @@ func Start(f embed.FS) {
 	r.GET("/stream/:number", stream)
 	//debug api
 	r.GET("/debug/count", debugCount)
-	//mrc20
-	r.GET("/mrc20/:page", mrc20List)
+	//mrc20 - 注意：更具体的路由要放在前面
+	r.GET("/mrc20/info/:id", mrc20Info)
+	r.GET("/mrc20/holders/:id/:page", mrc20Holders)
 	r.GET("/mrc20/history/:id/:page", mrc20History)
+	r.GET("/mrc20/address/:id/:address/:page", mrc20AddressHistory)
+	r.GET("/mrc20/:page", mrc20List)
 	//mrc721
 	r.GET("/mrc721/:page", mrc721List)
 	r.GET("/mrc721/item/list/:name/:page", mrc721ItemList)
 	//btc json api
 	btcJsonApi(r)
-	// mrc20JsonApi(r)
+	mrc20JsonApi(r)
 	// metaAccessJsonApi(r)
 	// mrc721JsonApi(r)
 	// if common.ModuleExist("metaso") || common.ModuleExist("metaso_pev") {
@@ -452,56 +460,166 @@ func node(ctx *gin.Context) {
 	// ctx.HTML(200, "home/node.html", &gin.H{"RootId": rootid, "Total": total, "Pins": list})
 }
 func mrc20List(ctx *gin.Context) {
-	//TODO mrc20 pagination
-	// page, err := strconv.ParseInt(ctx.Param("page"), 10, 64)
-	// if err != nil {
-	// 	ctx.String(200, "fail")
-	// 	return
-	// }
-	// cousor := (page - 1) * 100
-	// _, list, err := man.DbAdapter.GetMrc20TickPageList(cousor, 100, "", "", "")
-	// if err != nil {
-	// 	ctx.String(200, "fail")
-	// 	return
-	// }
-	// prePage := page - 1
-	// nextPage := page + 1
-	// if len(list) == 0 {
-	// 	nextPage = 0
-	// }
-	// if prePage <= 0 {
-	// 	prePage = 0
-	// }
-	// ctx.HTML(200, "home/mrc20.html", gin.H{"Ticks": list, "Active": "mrc20", "NextPage": nextPage, "PrePage": prePage})
+	page, err := strconv.ParseInt(ctx.Param("page"), 10, 64)
+	if err != nil || page < 1 {
+		page = 1
+	}
+	pageSize := 100
+	cursor := int((page - 1) * int64(pageSize))
+
+	list, err := man.PebbleStore.GetMrc20TickList(cursor, pageSize)
+	if err != nil {
+		ctx.String(200, "fail: "+err.Error())
+		return
+	}
+
+	prePage := page - 1
+	nextPage := page + 1
+	if len(list) < pageSize {
+		nextPage = 0
+	}
+	if prePage <= 0 {
+		prePage = 0
+	}
+	ctx.HTML(200, "home/mrc20.html", gin.H{"Ticks": list, "Active": "mrc20", "NextPage": nextPage, "PrePage": prePage})
 }
+
+func mrc20Info(ctx *gin.Context) {
+	tickId := ctx.Param("id")
+	if tickId == "" {
+		ctx.String(200, "fail: id is required")
+		return
+	}
+
+	tick, err := man.PebbleStore.GetMrc20TickInfo(tickId, "")
+	if err != nil {
+		ctx.String(200, "fail: "+err.Error())
+		return
+	}
+
+	ctx.HTML(200, "home/mrc20info.html", gin.H{"Tick": tick, "Active": "mrc20"})
+}
+
+func mrc20Holders(ctx *gin.Context) {
+	page, err := strconv.ParseInt(ctx.Param("page"), 10, 64)
+	if err != nil || page < 1 {
+		page = 1
+	}
+	pageSize := 20
+
+	tickId := ctx.Param("id")
+	if tickId == "" {
+		ctx.String(200, "fail: id is required")
+		return
+	}
+
+	searchAddress := ctx.Query("address")
+
+	// 获取 tick 信息
+	tick, _ := man.PebbleStore.GetMrc20TickInfo(tickId, "")
+
+	list, err := man.PebbleStore.GetMrc20Holders(tickId, int((page-1)*int64(pageSize)), pageSize, searchAddress)
+	if err != nil {
+		ctx.String(200, "fail: "+err.Error())
+		return
+	}
+
+	prePage := page - 1
+	nextPage := page + 1
+	if len(list) < pageSize {
+		nextPage = 0
+	}
+	if prePage <= 0 {
+		prePage = 0
+	}
+
+	ctx.HTML(200, "home/mrc20holders.html", gin.H{
+		"List":          list,
+		"TickId":        tickId,
+		"TickName":      tick.Tick,
+		"SearchAddress": searchAddress,
+		"Offset":        int((page - 1) * int64(pageSize)),
+		"Active":        "mrc20",
+		"NextPage":      nextPage,
+		"PrePage":       prePage,
+	})
+}
+
 func mrc20History(ctx *gin.Context) {
-	//TODO mrc20 history pagination
-	// page, err := strconv.ParseInt(ctx.Param("page"), 10, 64)
-	// if err != nil {
-	// 	ctx.String(200, "fail")
-	// 	return
-	// }
+	page, err := strconv.ParseInt(ctx.Param("page"), 10, 64)
+	if err != nil || page < 1 {
+		page = 1
+	}
+	pageSize := 20
 
-	// if ctx.Param("id") == "" {
-	// 	ctx.String(200, "fail")
-	// 	return
-	// }
-	// list, _, err := man.DbAdapter.GetMrc20HistoryPageList(ctx.Param("id"), true, page, 20)
-	// if err != nil {
-	// 	ctx.String(200, "fail")
-	// 	return
-	// }
-	// prePage := page - 1
-	// nextPage := page + 1
-	// if len(list) == 0 {
-	// 	nextPage = 0
-	// }
-	// if prePage <= 0 {
-	// 	prePage = 0
-	// }
+	tickId := ctx.Param("id")
+	if tickId == "" {
+		ctx.String(200, "fail: id is required")
+		return
+	}
 
-	// ctx.HTML(200, "home/mrc20history.html", gin.H{"List": list, "Tick": ctx.Param("id"), "Active": "", "NextPage": nextPage, "PrePage": prePage})
+	list, err := man.PebbleStore.GetMrc20TransferHistory(tickId, int((page-1)*int64(pageSize)), pageSize)
+	if err != nil {
+		ctx.String(200, "fail: "+err.Error())
+		return
+	}
+
+	prePage := page - 1
+	nextPage := page + 1
+	if len(list) < pageSize {
+		nextPage = 0
+	}
+	if prePage <= 0 {
+		prePage = 0
+	}
+
+	ctx.HTML(200, "home/mrc20history.html", gin.H{"List": list, "Tick": tickId, "Active": "", "NextPage": nextPage, "PrePage": prePage})
 }
+
+func mrc20AddressHistory(ctx *gin.Context) {
+	page, err := strconv.ParseInt(ctx.Param("page"), 10, 64)
+	if err != nil || page < 1 {
+		page = 1
+	}
+	pageSize := 20
+
+	tickId := ctx.Param("id")
+	address := ctx.Param("address")
+	if tickId == "" || address == "" {
+		ctx.String(200, "fail: id and address are required")
+		return
+	}
+
+	// 获取 tick 信息
+	tick, _ := man.PebbleStore.GetMrc20TickInfo(tickId, "")
+
+	// 使用带 Direction 的历史记录查询
+	list, _, err := man.PebbleStore.GetMrc20AddressHistoryWithDirection(tickId, address, int((page-1)*int64(pageSize)), pageSize, nil)
+	if err != nil {
+		ctx.String(200, "fail: "+err.Error())
+		return
+	}
+
+	prePage := page - 1
+	nextPage := page + 1
+	if len(list) < pageSize {
+		nextPage = 0
+	}
+	if prePage <= 0 {
+		prePage = 0
+	}
+
+	ctx.HTML(200, "home/mrc20addrhistory.html", gin.H{
+		"List":     list,
+		"TickId":   tickId,
+		"TickName": tick.Tick,
+		"Address":  address,
+		"Active":   "mrc20",
+		"NextPage": nextPage,
+		"PrePage":  prePage,
+	})
+}
+
 func mrc721List(ctx *gin.Context) {
 	//TODO mrc721 pagination
 	// page, err := strconv.ParseInt(ctx.Param("page"), 10, 64)

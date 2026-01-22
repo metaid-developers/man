@@ -33,6 +33,7 @@ var (
 	IsSync         bool
 	IsTestNet      bool = false
 	PebbleStore    *PebbleData
+	ChainList      []string // 保持链的顺序
 )
 
 // InitAdapter 初始化区块链适配器
@@ -59,6 +60,7 @@ func InitAdapter(chainType, dbType, test, server string) {
 		}
 	}
 	chainList := strings.Split(chainType, ",")
+	ChainList = chainList // 保存顺序
 	for _, chain := range chainList {
 		ChainParams[chain] = "mainnet"
 		if test == "1" {
@@ -136,9 +138,10 @@ func doZmqRun(chain string, indexer adapter.Indexer) {
 
 // IndexerRun 执行区块链索引
 func IndexerRun(test string) {
-	for chainName := range ChainAdapter {
+	// 使用 ChainList 保证按 -chain 参数顺序索引
+	for _, chainName := range ChainList {
 		from, to := getSyncHeight(chainName, test)
-		log.Printf("IndexerRun for chain: %s, from: %d, to: %d", chainName, from, to)
+		//log.Printf("IndexerRun for chain: %s, from: %d, to: %d", chainName, from, to)
 		if from >= to {
 			FirstCompleted = true
 			continue
@@ -160,6 +163,96 @@ func IndexerRun(test string) {
 	}
 	FirstCompleted = true
 
+}
+
+// Mrc20CatchUpRun MRC20 补索引：处理从 mrc20Height 到当前主索引高度之间的区块
+func Mrc20CatchUpRun() {
+	if !isModuleEnabled("mrc20") {
+		return
+	}
+
+	// 使用 ChainList 保证按 -chain 参数顺序处理
+	for _, chainName := range ChainList {
+		// 获取 MRC20 配置的启动高度
+		var mrc20StartHeight int64
+		switch chainName {
+		case "btc":
+			mrc20StartHeight = common.Config.Btc.Mrc20Height
+		case "mvc":
+			mrc20StartHeight = common.Config.Mvc.Mrc20Height
+		case "doge":
+			mrc20StartHeight = common.Config.Doge.Mrc20Height
+		default:
+			continue
+		}
+
+		if mrc20StartHeight <= 0 {
+			continue
+		}
+
+		// 获取 MRC20 当前索引进度
+		mrc20CurrentHeight := PebbleStore.GetMrc20IndexHeight(chainName)
+
+		// 获取主索引进度
+		syncKey := fmt.Sprintf("%s_sync_height", chainName)
+		dbHeight, closer, err := PebbleStore.Database.MetaDb.Get([]byte(syncKey))
+		var mainHeight int64
+		if err != nil || len(dbHeight) == 0 {
+			mainHeight = 0
+			if closer != nil {
+				closer.Close()
+			}
+		} else {
+			mainHeight, _ = strconv.ParseInt(string(dbHeight), 10, 64)
+			closer.Close()
+		}
+
+		// MRC20-ONLY 模式特殊处理：如果 MRC20 进度更高，同步主索引进度
+		if common.Config.Sync.Mrc20Only && mrc20CurrentHeight > mainHeight {
+			log.Printf("[MRC20-ONLY] Syncing main index height to MRC20 height for %s: %d -> %d",
+				chainName, mainHeight, mrc20CurrentHeight)
+			PebbleStore.Database.MetaDb.Set([]byte(syncKey), []byte(strconv.FormatInt(mrc20CurrentHeight, 10)), pebble.Sync)
+			mainHeight = mrc20CurrentHeight
+			log.Printf("[MRC20-ONLY] Main index height updated. MRC20 will continue from %d", mrc20CurrentHeight+1)
+			continue // 不需要补索引，直接进入 ZMQ 模式
+		}
+
+		// 如果 MRC20 还未开始索引，从启动高度开始
+		from := mrc20CurrentHeight
+		if from == 0 {
+			from = mrc20StartHeight - 1
+		}
+
+		to := mainHeight
+
+		// 如果 MRC20 索引落后于主索引，需要补索引
+		if from < to && to >= mrc20StartHeight {
+			log.Printf("MRC20 catch-up for chain: %s, from: %d, to: %d", chainName, from+1, to)
+
+			barinfo := fmt.Sprintf("[MRC20 %s %d-%d]", chainName, from+1, to)
+			bar := progressbar.Default(to-from, barinfo)
+
+			for height := from + 1; height <= to; height++ {
+				// 读取该区块的 PIN 数据（已经被主索引处理过）
+				// CatchPins 返回 (pinList, txInList, creatorMap)，第三个参数不是 error
+				pinList, txInList, _ := IndexerAdapter[chainName].CatchPins(height)
+
+				// 只处理 MRC20
+				PebbleStore.handleMrc20(chainName, height, pinList, txInList)
+
+				bar.Add(1)
+
+				// 定期输出进度（每100个区块）
+				if height%100 == 0 {
+					log.Printf("MRC20 catch-up progress for %s: %d/%d", chainName, height, to)
+				}
+			}
+
+			log.Printf("MRC20 catch-up completed for chain: %s", chainName)
+		} else if mrc20CurrentHeight >= mainHeight {
+			log.Printf("MRC20 for chain %s is up to date: %d", chainName, mrc20CurrentHeight)
+		}
+	}
 }
 
 // getSyncHeight 获取需要同步的区块高度范围

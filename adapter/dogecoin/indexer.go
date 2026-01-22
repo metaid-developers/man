@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
@@ -24,6 +25,7 @@ type Indexer struct {
 	Block       interface{}
 	PopCutNum   int
 	ChainName   string
+	TxCache     map[string]*btcutil.Tx // 当前区块的交易缓存，供 MRC20 处理使用
 }
 
 func (indexer *Indexer) InitIndexer() {
@@ -73,6 +75,15 @@ func (indexer *Indexer) CatchPins(blockHeight int64) (pinInscriptions *[]*pin.Pi
 	timestamp := block.Header.Timestamp.Unix()
 	blockHash := block.BlockHash().String()
 	merkleRoot := block.Header.MerkleRoot.String()
+
+	// 构建交易缓存（用于 MRC20 处理时避免 GetTransaction RPC 调用）
+	// 缓存存入 indexer.TxCache，由 man 包在处理 MRC20 前读取
+	indexer.TxCache = make(map[string]*btcutil.Tx)
+	for _, tx := range block.Transactions {
+		txid := tx.TxHash().String()
+		indexer.TxCache[txid] = btcutil.NewTx(tx)
+	}
+
 	for i, tx := range block.Transactions {
 		for _, in := range tx.TxIn {
 			id := common.ConcatBytesOptimized([]string{in.PreviousOutPoint.Hash.String(), ":", strconv.FormatUint(uint64(in.PreviousOutPoint.Index), 10)}, "")
@@ -112,12 +123,16 @@ func (indexer *Indexer) CatchTransfer(idMap map[string]string) (trasferMap map[s
 	trasferMap = make(map[string]*pin.PinTransferInfo)
 	block := indexer.Block.(*wire.MsgBlock)
 	for _, tx := range block.Transactions {
+		// 检测是否为溶解交易
+		isDissolve := indexer.IsDissolveTransaction(tx, idMap)
+
 		for _, in := range tx.TxIn {
 			id := fmt.Sprintf("%s:%d", in.PreviousOutPoint.Hash.String(), in.PreviousOutPoint.Index)
 			if fromAddress, ok := idMap[id]; ok {
 				info, err := indexer.GetOWnerAddress(id, tx)
 				if err == nil && info != nil {
 					info.FromAddress = fromAddress
+					info.IsDissolve = isDissolve
 					trasferMap[id] = info
 				}
 			}
@@ -126,10 +141,55 @@ func (indexer *Indexer) CatchTransfer(idMap map[string]string) (trasferMap map[s
 	return
 }
 
+// IsDissolveTransaction 检测是否为溶解交易
+// 溶解条件:
+// 1. 输入有 ≥3 个 546 聪的 PIN-UTXO
+// 2. 输出只有 1 个
+// 3. 输入和输出地址相同
+func (indexer *Indexer) IsDissolveTransaction(tx *wire.MsgTx, idMap map[string]string) bool {
+	// 条件2: 输出只有1个
+	if len(tx.TxOut) != 1 {
+		return false
+	}
+
+	// 获取输出地址
+	outAddress := ""
+	_, addresses, _, _ := txscript.ExtractPkScriptAddrs(tx.TxOut[0].PkScript, netParams)
+	if len(addresses) > 0 {
+		outAddress = addresses[0].String()
+	}
+	if outAddress == "" {
+		return false
+	}
+
+	// 统计输入中符合条件的 PIN-UTXO 数量
+	pinUtxoCount := 0
+	allSameAddress := true
+
+	for _, in := range tx.TxIn {
+		id := fmt.Sprintf("%s:%d", in.PreviousOutPoint.Hash.String(), in.PreviousOutPoint.Index)
+		if fromAddress, ok := idMap[id]; ok {
+			// 这是一个 PIN-UTXO，检查金额是否为 546
+			value, err := GetValueByTx(in.PreviousOutPoint.Hash.String(), int(in.PreviousOutPoint.Index))
+			if err == nil && value == pin.StandardPinUtxoValue {
+				pinUtxoCount++
+				// 条件3: 检查输入地址是否与输出地址相同
+				if fromAddress != outAddress {
+					allSameAddress = false
+				}
+			}
+		}
+	}
+
+	// 条件1: 输入有 ≥3 个 546 聪的 PIN-UTXO
+	// 条件3: 所有 PIN 输入地址都与输出地址相同
+	return pinUtxoCount >= pin.DissolveMinPinCount && allSameAddress
+}
+
 func (indexer *Indexer) CatchNativeMrc20Transfer(blockHeight int64, utxoList []*mrc20.Mrc20Utxo, mrc20TransferPinTx map[string]struct{}) (savelist []*mrc20.Mrc20Utxo) {
 	pointMap := make(map[string][]*mrc20.Mrc20Utxo)
 	for _, u := range utxoList {
-		if u.MrcOption == "deploy" {
+		if u.MrcOption == mrc20.OptionDeploy {
 			continue
 		}
 		pointMap[u.TxPoint] = append(pointMap[u.TxPoint], u)
@@ -152,7 +212,7 @@ func (indexer *Indexer) CatchNativeMrc20Transfer(blockHeight int64, utxoList []*
 func (indexer *Indexer) CatchMempoolNativeMrc20Transfer(txList []interface{}, utxoList []*mrc20.Mrc20Utxo, mrc20TransferPinTx map[string]struct{}) (savelist []*mrc20.Mrc20Utxo) {
 	pointMap := make(map[string][]*mrc20.Mrc20Utxo)
 	for _, u := range utxoList {
-		if u.MrcOption == "deploy" {
+		if u.MrcOption == mrc20.OptionDeploy {
 			continue
 		}
 		pointMap[u.TxPoint] = append(pointMap[u.TxPoint], u)
@@ -179,7 +239,15 @@ func (indexer *Indexer) createMrc20NativeTransfer(tx *wire.MsgTx, blockHeight in
 		if v, ok := pointMap[id]; ok {
 			for _, utxo := range v {
 				send := *utxo
-				send.Status = -1
+				// 根据 blockHeight 判断是 mempool 还是出块
+				if blockHeight == -1 {
+					// mempool 阶段：设置为 TransferPending（待转出）
+					send.Status = mrc20.UtxoStatusTransferPending
+				} else {
+					// 出块确认：设置为 Spent（已消耗）
+					send.Status = mrc20.UtxoStatusSpent
+				}
+				send.MrcOption = mrc20.OptionNativeTransfer
 				send.OperationTx = tx.TxHash().String()
 				mrc20Utxolist = append(mrc20Utxolist, &send)
 				key := send.Mrc20Id
@@ -188,7 +256,7 @@ func (indexer *Indexer) createMrc20NativeTransfer(tx *wire.MsgTx, blockHeight in
 					keyMap[key].AmtChange = keyMap[key].AmtChange.Add(send.AmtChange)
 				} else {
 					recive := *utxo
-					recive.MrcOption = "native-transfer"
+					recive.MrcOption = mrc20.OptionNativeTransfer
 					recive.FromAddress = recive.ToAddress
 					recive.ToAddress = indexer.GetAddress(tx.TxOut[0].PkScript)
 					recive.BlockHeight = blockHeight
@@ -311,6 +379,7 @@ func (indexer *Indexer) CatchPinsByTx(msgTxInf interface{}, blockHeight int64, t
 				InitialOwner:       address,
 				CreateAddress:      creator,
 				CreateMetaId:       common.GetMetaIdByAddress(creator),
+				GlobalMetaId:       common.ConvertToGlobalMetaId(creator),
 				Timestamp:          timestamp,
 				GenesisHeight:      blockHeight,
 				GenesisTransaction: txHash,
@@ -414,6 +483,7 @@ func (indexer *Indexer) CatchPinsByTx(msgTxInf interface{}, blockHeight int64, t
 			InitialOwner:       address,
 			CreateAddress:      creator,
 			CreateMetaId:       common.GetMetaIdByAddress(creator),
+			GlobalMetaId:       common.ConvertToGlobalMetaId(creator),
 			Timestamp:          timestamp,
 			GenesisHeight:      blockHeight,
 			GenesisTransaction: msgTx.TxHash().String(),
@@ -558,6 +628,13 @@ func (indexer *Indexer) GetPinOwner(tx *wire.MsgTx, inIdx int) (address string, 
 		}
 		value, err := GetValueByTx(in.PreviousOutPoint.Hash.String(), int(in.PreviousOutPoint.Index))
 		if err != nil {
+			// 如果无法获取输入值（例如节点没有 txindex），
+			// 默认使用第一个输出地址作为 PIN owner
+			// 这对于大多数 MRC20 操作是正确的
+			_, addresses, _, _ := txscript.ExtractPkScriptAddrs(tx.TxOut[0].PkScript, netParams)
+			if len(addresses) > 0 {
+				address = addresses[0].String()
+			}
 			return
 		}
 		inputValue += value
@@ -727,15 +804,15 @@ func (indexer *Indexer) ParsePinFromDirectScriptSig(scriptSig []byte) (pinode *p
 	}
 
 	// Validate operation
-	if pinode.Operation != "create" && pinode.Operation != "modify" && pinode.Operation != "revoke" {
+	if pinode.Operation != "create" && pinode.Operation != "modify" && pinode.Operation != "revoke" && pinode.Operation != "hide" {
 		return nil
 	}
 
-	// For revoke, we need at least 5 fields; for others, at least 6
+	// For revoke, we need at least 5 fields; for others, at least 6 (excluding operation itself)
 	if pinode.Operation == "revoke" && len(infoList) < 5 {
 		return nil
 	}
-	if pinode.Operation != "revoke" && len(infoList) < 7 {
+	if pinode.Operation != "revoke" && len(infoList) < 6 {
 		return nil
 	}
 

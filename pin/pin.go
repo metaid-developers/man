@@ -18,6 +18,18 @@ const (
 var AllCreatorAddress sync.Map
 var AllMrcPinId sync.Map
 
+// PIN 状态常量
+const (
+	PinStatusNormal    = 0  // 正常状态
+	PinStatusDissolved = -2 // 溶解状态 - PIN被合并销毁，UTXO释放
+)
+
+// 溶解交易的最小 PIN UTXO 数量
+const DissolveMinPinCount = 3
+
+// 标准 PIN UTXO 金额 (546 聪)
+const StandardPinUtxoValue = 546
+
 type PinInscription struct {
 	Id                     string          `json:"id"`
 	Number                 int64           `json:"number"`
@@ -25,6 +37,7 @@ type PinInscription struct {
 	Address                string          `json:"address"`
 	CreateAddress          string          `json:"creator"`
 	CreateMetaId           string          `json:"createMetaId"`
+	GlobalMetaId           string          `json:"globalMetaId"`
 	InitialOwner           string          `json:"initialOwner"`
 	Output                 string          `json:"output"`
 	OutputValue            int64           `json:"outputValue"`
@@ -75,6 +88,7 @@ type PinTransferInfo struct {
 	Offset      uint64 `json:"offset"`
 	Location    string `json:"location"`
 	FromAddress string `json:"fromAddress"`
+	IsDissolve  bool   `json:"isDissolve"` // 是否为溶解交易
 }
 type PinTransferHistory struct {
 	PinId          string `json:"pinId"`

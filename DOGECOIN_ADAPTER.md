@@ -1,4 +1,4 @@
-S# Dogecoin 适配器使用指南
+# Dogecoin 适配器使用指南
 
 ## 概述
 

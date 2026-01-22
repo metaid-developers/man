@@ -144,9 +144,15 @@ func NewDataBase(basePath string, shardNum int) (*Database, error) {
 		log.Println(err)
 		return nil, err
 	}
+	os.MkdirAll(fmt.Sprintf("%s/mrc20", basePath), 0755)
+	mrcDb, err := pebble.Open(fmt.Sprintf("%s/mrc20/db", basePath), dbOptions)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
 	return &Database{PinsDBs: pinsDBs, PinSort: pinSortDb, BlocksDB: blocksDB,
 		CountDB: countDB, PathPinDB: pathPinDB, AddressDB: addressDB,
-		CreatorDb: creatorDb, PinsMempoolDb: mempoolDb, NotifcationDb: notifcationDb, MetaDb: metaDb, MetaidInfoDB: metaIdInfoDb, TransferDb: transferDb}, nil
+		CreatorDb: creatorDb, PinsMempoolDb: mempoolDb, NotifcationDb: notifcationDb, MetaDb: metaDb, MetaidInfoDB: metaIdInfoDb, TransferDb: transferDb, MrcDb: mrcDb}, nil
 }
 
 // Close 关闭所有数据库

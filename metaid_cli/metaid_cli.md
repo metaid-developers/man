@@ -1,3 +1,9 @@
+### 支持WEB图形界面
+```
+./metaid-cli web --chain btc --port 8080
+./metaid-cli web --chain doge --port 8081
+```
+
 ### 完整的命令：
    - `metaid-cli init` - 初始化
    - `metaid-cli address create/list` - 地址管理

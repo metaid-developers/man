@@ -2,8 +2,10 @@ package man
 
 import (
 	"fmt"
+	"log"
 	"strconv"
 
+	"manindexer/adapter/dogecoin"
 	"manindexer/common"
 	"manindexer/pebblestore"
 
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/bytedance/sonic"
+	"github.com/cockroachdb/pebble"
 )
 
 type PebbleData struct {
@@ -34,9 +37,24 @@ func (pd *PebbleData) DoIndexerRun(chainName string, height int64, reIndex bool)
 	if !reIndex {
 		MaxHeight[chainName] = height
 	}
+
+	// MRC20 Only 模式：只处理 MRC20，跳过其他所有 PIN 数据处理
+	if common.Config.Sync.Mrc20Only {
+		return pd.doMrc20OnlyRun(chainName, height)
+	}
+
 	txInList := &[]string{}
 	pinList := &[]*pin.PinInscription{}
 	pinList, txInList, _ = IndexerAdapter[chainName].CatchPins(height)
+
+	// 对于 Doge 链，从 Indexer 获取交易缓存并设置到 MRC20 处理器
+	// 这样 MRC20 处理时可以从缓存获取交易，避免 GetTransaction RPC 调用失败（Doge 节点没有 txindex）
+	if chainName == "doge" {
+		if dogeIndexer, ok := IndexerAdapter[chainName].(*dogecoin.Indexer); ok && dogeIndexer.TxCache != nil {
+			SetDogeTxCache(dogeIndexer.TxCache)
+		}
+	}
+
 	//保存PIN数据
 	if len(*pinList) > 0 {
 		//fmt.Println("SetAllPins start height:", height, " Num:", len(pinList))
@@ -59,11 +77,39 @@ func (pd *PebbleData) DoIndexerRun(chainName string, height int64, reIndex bool)
 		pd.handleTransfer(chainName, *txInList, height)
 	}
 
+	// 处理 MRC20（只有当 MRC20 进度已追上时才处理）
+	if isModuleEnabled("mrc20") {
+		pd.handleMrc20(chainName, height, pinList, txInList)
+	}
+
 	pinList = nil
 	txInList = nil
 	if FirstCompleted {
 		DeleteMempoolData(height, chainName)
 	}
+	return
+}
+
+// doMrc20OnlyRun 只处理 MRC20 相关数据，跳过 PIN 存储和其他操作
+func (pd *PebbleData) doMrc20OnlyRun(chainName string, height int64) (err error) {
+	txInList := &[]string{}
+	pinList := &[]*pin.PinInscription{}
+	pinList, txInList, _ = IndexerAdapter[chainName].CatchPins(height)
+
+	// 对于 Doge 链，从 Indexer 获取交易缓存并设置到 MRC20 处理器
+	if chainName == "doge" {
+		if dogeIndexer, ok := IndexerAdapter[chainName].(*dogecoin.Indexer); ok && dogeIndexer.TxCache != nil {
+			SetDogeTxCache(dogeIndexer.TxCache)
+		}
+	}
+
+	// 只处理 MRC20
+	if isModuleEnabled("mrc20") {
+		pd.handleMrc20(chainName, height, pinList, txInList)
+	}
+
+	pinList = nil
+	txInList = nil
 	return
 }
 
@@ -83,6 +129,29 @@ func (pd *PebbleData) SetPinIdList(chainName string, height int64) (err error) {
 	pinIdList = nil
 	fmt.Println(">> SetPinIdList done for height:", chainName, height)
 	return
+}
+
+// GetMrc20IndexHeight 获取 MRC20 索引进度
+func (pd *PebbleData) GetMrc20IndexHeight(chainName string) int64 {
+	syncKey := fmt.Sprintf("%s_mrc20_sync_height", chainName)
+	dbHeight, closer, err := pd.Database.MetaDb.Get([]byte(syncKey))
+	if err == nil && len(dbHeight) > 0 {
+		defer closer.Close()
+		height, err := strconv.ParseInt(string(dbHeight), 10, 64)
+		if err == nil {
+			return height
+		}
+	}
+	if closer != nil {
+		closer.Close()
+	}
+	return 0
+}
+
+// SaveMrc20IndexHeight 保存 MRC20 索引进度
+func (pd *PebbleData) SaveMrc20IndexHeight(chainName string, height int64) error {
+	syncKey := fmt.Sprintf("%s_mrc20_sync_height", chainName)
+	return pd.Database.MetaDb.Set([]byte(syncKey), []byte(strconv.FormatInt(height, 10)), pebble.Sync)
 }
 
 func (pd *PebbleData) handleTransfer(chainName string, outputList []string, blockHeight int64) {
@@ -357,4 +426,82 @@ func (pd *PebbleData) GetAllPinByPathPageList(path string, cursor string, size i
 	}
 
 	return pinList, total, nextCursor, err
+}
+
+// isModuleEnabled 检查模块是否启用
+func isModuleEnabled(moduleName string) bool {
+	for _, m := range common.Config.Module {
+		if m == moduleName {
+			return true
+		}
+	}
+	return false
+}
+
+// handleMrc20 处理 MRC20 相关交易
+func (pd *PebbleData) handleMrc20(chainName string, height int64, pinList *[]*pin.PinInscription, txInList *[]string) {
+	// 获取该链的 MRC20 启动高度
+	var mrc20Height int64
+	switch chainName {
+	case "btc":
+		mrc20Height = common.Config.Btc.Mrc20Height
+	case "mvc":
+		mrc20Height = common.Config.Mvc.Mrc20Height
+	case "doge":
+		mrc20Height = common.Config.Doge.Mrc20Height
+	default:
+		log.Printf("[MRC20] Unknown chain: %s", chainName)
+		return
+	}
+
+	log.Printf("[MRC20] handleMrc20 called: chain=%s, height=%d, mrc20Height=%d, pinList=%d", chainName, height, mrc20Height, len(*pinList))
+
+	// 检查是否配置了 MRC20 启动高度
+	// mrc20Height < 0 表示禁用 MRC20，mrc20Height >= 0 表示从该高度开始启用
+	if mrc20Height < 0 {
+		log.Printf("[MRC20] Disabled for chain %s (mrc20Height=%d)", chainName, mrc20Height)
+		return
+	}
+
+	// 检查当前区块是否达到 MRC20 启动高度
+	if height < mrc20Height {
+		log.Printf("[MRC20] Block height %d < mrc20Height %d, skipping", height, mrc20Height)
+		return
+	}
+
+	// 【关键】检查 MRC20 进度是否已追上
+	// MRC20 必须严格按顺序处理，不能跳过中间的区块
+	mrc20CurrentHeight := pd.GetMrc20IndexHeight(chainName)
+	log.Printf("[MRC20] mrc20CurrentHeight=%d, height=%d", mrc20CurrentHeight, height)
+	if mrc20CurrentHeight > 0 && mrc20CurrentHeight < height-1 {
+		// MRC20 进度落后，需要先补索引，跳过当前区块
+		// 例如：mrc20CurrentHeight=820000, height=850000
+		// 必须先处理 820001-849999，才能处理 850000
+		log.Printf("[MRC20] Progress behind, need catch-up: current=%d, target=%d", mrc20CurrentHeight, height)
+		return
+	}
+
+	// 筛选 MRC20 相关的 PIN
+	var mrc20List []*pin.PinInscription
+	mrc20TransferPinTx := make(map[string]struct{})
+
+	for _, pinNode := range *pinList {
+		if strings.HasPrefix(pinNode.Path, "/ft/mrc20/") {
+			mrc20List = append(mrc20List, pinNode)
+			if pinNode.Path == "/ft/mrc20/transfer" {
+				mrc20TransferPinTx[pinNode.GenesisTransaction] = struct{}{}
+			}
+		}
+	}
+
+	log.Printf("[MRC20] Found %d MRC20 PINs in block %d", len(mrc20List), height)
+
+	// 调用 MRC20 处理函数
+	// 注意：即使没有 MRC20 PIN，也需要处理 Native Transfer（通过 txInList）
+	// txInList 包含该区块所有交易的输入，可能花费了之前区块创建的 MRC20 UTXO
+	Mrc20Handle(chainName, height, mrc20List, mrc20TransferPinTx, *txInList, false)
+
+	// 保存 MRC20 索引进度
+	pd.SaveMrc20IndexHeight(chainName, height)
+	log.Printf("[MRC20] Saved progress for %s: height=%d", chainName, height)
 }

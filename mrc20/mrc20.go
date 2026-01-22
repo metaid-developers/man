@@ -1,6 +1,9 @@
 package mrc20
 
 import (
+	"encoding/json"
+	"fmt"
+
 	"github.com/shopspring/decimal"
 )
 
@@ -32,6 +35,24 @@ const (
 	ErrTranferAmt           = "the amount should be greater than 0"
 )
 
+// UTXO Status 常量定义
+const (
+	UtxoStatusAvailable       = 0  // 可用
+	UtxoStatusTeleportPending = 1  // 等待跃迁中 (teleport transfer mempool)
+	UtxoStatusTransferPending = 2  // 等待转账确认中 (普通/native transfer mempool)
+	UtxoStatusSpent           = -1 // 已消耗
+)
+
+// MrcOption 操作类型常量定义
+const (
+	OptionDeploy           = "deploy"            // 部署代币
+	OptionMint             = "mint"              // 铸造代币
+	OptionPreMint          = "pre-mint"          // 预挖代币
+	OptionNativeTransfer   = "native-transfer"   // 原生转账 (直接花费 UTXO，无 PIN)
+	OptionDataTransfer     = "data-transfer"     // 数据转账 (通过 /ft/mrc20/transfer PIN)
+	OptionTeleportTransfer = "teleport-transfer" // 跃迁转账 (跨链)
+)
+
 type Mrc20Utxo struct {
 	Tick        string          `json:"tick"`
 	Mrc20Id     string          `json:"mrc20Id"`
@@ -41,7 +62,7 @@ type Mrc20Utxo struct {
 	PinContent  string          `json:"pinContent"`
 	Verify      bool            `json:"verify"`
 	BlockHeight int64           `json:"blockHeight"`
-	MrcOption   string          `json:"mrcOption"`
+	MrcOption   string          `json:"mrcOption"` // 操作类型: deploy, mint, pre-mint, transfer, teleport
 	FromAddress string          `json:"fromAddress"`
 	ToAddress   string          `json:"toAddress"`
 	Msg         string          `json:"msg"`
@@ -133,14 +154,141 @@ type Mrc20TranferData struct {
 	Id     string `json:"id"`
 }
 type Mrc20Balance struct {
-	Id            string          `json:"id"`
-	Name          string          `json:"name"`
-	Balance       decimal.Decimal `json:"balance"`
-	UnsafeBalance decimal.Decimal `json:"unsafeBalance"`
+	Id                string          `json:"id"`
+	Name              string          `json:"name"`
+	Balance           decimal.Decimal `json:"balance"`           // 已确认的可用余额
+	PendingInBalance  decimal.Decimal `json:"pendingInBalance"`  // 待转入余额（所有类型 transfer 接收方 mempool 阶段）
+	PendingOutBalance decimal.Decimal `json:"pendingOutBalance"` // 待转出余额（所有类型 transfer 发送方 mempool 阶段）
+	Chain             string          `json:"chain"`
 }
 type Mrc20MempoolBalance struct {
 	Id        string          `json:"id"`
 	Name      string          `json:"name"`
 	SpendUtxo []string        `json:"send"`
 	Recive    decimal.Decimal `json:"recive"`
+}
+
+// Teleport 跃迁相关数据结构
+
+// ArrivalStatus 表示 arrival 的状态
+type ArrivalStatus int
+
+const (
+	ArrivalStatusPending   ArrivalStatus = 0 // 等待中 - 等待源链的 teleport
+	ArrivalStatusCompleted ArrivalStatus = 1 // 已完成 - 跃迁成功
+	ArrivalStatusInvalid   ArrivalStatus = 2 // 无效 - 验证失败
+)
+
+// FlexibleString 是一个可以同时解析 JSON 字符串和数字的类型
+type FlexibleString string
+
+func (f *FlexibleString) UnmarshalJSON(data []byte) error {
+	// 尝试作为字符串解析
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		*f = FlexibleString(s)
+		return nil
+	}
+	// 尝试作为数字解析
+	var n json.Number
+	if err := json.Unmarshal(data, &n); err == nil {
+		*f = FlexibleString(n.String())
+		return nil
+	}
+	return fmt.Errorf("cannot unmarshal %s into FlexibleString", string(data))
+}
+
+// Mrc20ArrivalData 是 /ft/mrc20/arrival PIN 的内容结构
+type Mrc20ArrivalData struct {
+	AssetOutpoint string         `json:"assetOutpoint"` // 源链 MRC20 UTXO 的 outpoint (txid:vout)
+	Amount        FlexibleString `json:"amount"`        // 跃迁的金额 (可以是字符串或数字)
+	TickId        string         `json:"tickId"`        // MRC20 ID (部署 PIN 的 ID)
+	LocationIndex int            `json:"locationIndex"` // 目标链接收资产的 output 索引
+	Metadata      string         `json:"metadata"`      // 可选的元数据
+}
+
+// Mrc20Arrival 表示一个跨链到达记录
+type Mrc20Arrival struct {
+	PinId         string          `json:"pinId"`         // arrival PIN 的 ID (用作 coord)
+	TxId          string          `json:"txId"`          // arrival 交易的 txid
+	AssetOutpoint string          `json:"assetOutpoint"` // 源链 UTXO 的 outpoint
+	Amount        decimal.Decimal `json:"amount"`        // 跃迁金额
+	TickId        string          `json:"tickId"`        // MRC20 ID
+	Tick          string          `json:"tick"`          // MRC20 名称
+	LocationIndex int             `json:"locationIndex"` // 目标链接收 output 索引
+	ToAddress     string          `json:"toAddress"`     // 接收地址 (output[locationIndex]的地址)
+	Chain         string          `json:"chain"`         // 目标链名称 (arrival 所在的链)
+	SourceChain   string          `json:"sourceChain"`   // 源链名称 (从 UTXO 推断)
+	Status        ArrivalStatus   `json:"status"`        // 状态: pending/completed/invalid
+	Msg           string          `json:"msg"`           // 错误消息或备注
+	BlockHeight   int64           `json:"blockHeight"`   // 区块高度
+	Timestamp     int64           `json:"timestamp"`     // 时间戳
+	TeleportPinId string          `json:"teleportPinId"` // 完成跃迁的 teleport PIN ID
+	TeleportChain string          `json:"teleportChain"` // teleport 所在的链
+	TeleportTxId  string          `json:"teleportTxId"`  // teleport 交易的 txid
+	CompletedAt   int64           `json:"completedAt"`   // 跃迁完成时间
+}
+
+// Mrc20TeleportTransferData 是 teleport 类型 transfer 的扩展字段
+type Mrc20TeleportTransferData struct {
+	Amount string `json:"amount"` // 跃迁金额
+	Vout   int    `json:"vout"`   // output 索引 (对于 teleport 通常不使用)
+	Id     string `json:"id"`     // MRC20 ID
+	Coord  string `json:"coord"`  // 目标链 arrival 的 PINID
+	Chain  string `json:"chain"`  // 目标链名称
+	Type   string `json:"type"`   // "teleport"
+}
+
+// Mrc20Teleport 表示一个跃迁传输记录
+type Mrc20Teleport struct {
+	PinId          string          `json:"pinId"`          // teleport transfer PIN 的 ID
+	TxId           string          `json:"txId"`           // teleport 交易的 txid
+	TickId         string          `json:"tickId"`         // MRC20 ID
+	Tick           string          `json:"tick"`           // MRC20 名称
+	Amount         decimal.Decimal `json:"amount"`         // 跃迁金额
+	Coord          string          `json:"coord"`          // 目标链 arrival 的 PINID
+	FromAddress    string          `json:"fromAddress"`    // 源地址
+	SourceChain    string          `json:"sourceChain"`    // 源链名称 (teleport 所在的链)
+	TargetChain    string          `json:"targetChain"`    // 目标链名称
+	SpentUtxoPoint string          `json:"spentUtxoPoint"` // 消耗的 UTXO outpoint
+	Status         int             `json:"status"`         // 0=进行中, 1=已完成, -1=失败
+	Msg            string          `json:"msg"`            // 错误消息
+	BlockHeight    int64           `json:"blockHeight"`    // 区块高度
+	Timestamp      int64           `json:"timestamp"`      // 时间戳
+}
+
+// PendingTeleport 表示等待 arrival 的 teleport transfer
+// 当 transfer 先于 arrival 出块时，存入此队列等待匹配
+type PendingTeleport struct {
+	PinId         string `json:"pinId"`         // transfer PIN ID
+	TxId          string `json:"txId"`          // transfer 交易 ID
+	Coord         string `json:"coord"`         // 期望的 arrival PIN ID
+	TickId        string `json:"tickId"`        // MRC20 ID
+	Amount        string `json:"amount"`        // 跃迁金额
+	AssetOutpoint string `json:"assetOutpoint"` // 待跃迁的 UTXO txpoint
+	TargetChain   string `json:"targetChain"`   // 目标链
+	FromAddress   string `json:"fromAddress"`   // 发送者地址
+	SourceChain   string `json:"sourceChain"`   // 源链
+	BlockHeight   int64  `json:"blockHeight"`   // 区块高度
+	Timestamp     int64  `json:"timestamp"`     // 时间戳
+	RetryCount    int    `json:"retryCount"`    // 重试次数
+	Status        int    `json:"status"`        // 状态: 0=pending, 1=completed, -1=invalid
+	RawContent    []byte `json:"rawContent"`    // 原始 PIN 内容
+}
+
+// TeleportPendingIn 表示 teleport 接收方的待转入余额记录
+// 当 arrival 和 teleport transfer 都在 mempool/出块后，但跃迁未最终完成时创建
+type TeleportPendingIn struct {
+	Coord       string          `json:"coord"`       // arrival PIN ID (唯一标识)
+	ToAddress   string          `json:"toAddress"`   // 接收地址 (B 地址)
+	TickId      string          `json:"tickId"`      // MRC20 ID
+	Tick        string          `json:"tick"`        // MRC20 名称
+	Amount      decimal.Decimal `json:"amount"`      // 跃迁金额
+	Chain       string          `json:"chain"`       // 目标链 (接收方所在链)
+	SourceChain string          `json:"sourceChain"` // 源链
+	FromAddress string          `json:"fromAddress"` // 发送方地址
+	TeleportTx  string          `json:"teleportTx"`  // teleport 交易 ID
+	ArrivalTx   string          `json:"arrivalTx"`   // arrival 交易 ID
+	BlockHeight int64           `json:"blockHeight"` // 记录创建时的区块高度 (-1 表示 mempool)
+	Timestamp   int64           `json:"timestamp"`   // 时间戳
 }

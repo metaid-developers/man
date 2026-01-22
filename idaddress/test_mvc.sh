@@ -1,75 +1,75 @@
 #!/bin/bash
 
-# MVC Test Script - Key Generation and Transfer Testing
+# MVC测试脚本 - 密钥生成和转账测试
 
 set -e
 
 echo "========================================="
-echo "MVC Chain Testing Tool"
+echo "MVC 链测试工具"
 echo "========================================="
 echo ""
 
-# Compile tools
-echo "1. Compiling test tool..."
+# 编译工具
+echo "1. 编译测试工具..."
 cd cmd/mvctest
 go build -o mvctest
 if [ $? -ne 0 ]; then
-    echo "❌ Compilation failed"
+    echo "❌ 编译失败"
     exit 1
 fi
-echo "✓ Compilation successful"
+echo "✓ 编译成功"
 echo ""
 
-# Generate key pair
-echo "2. Generating new key pair..."
+# 生成密钥对
+echo "2. 生成新的密钥对..."
 ./mvctest generate > keypair.txt
 cat keypair.txt
 echo ""
 
-# Extract address information
-MVC_ADDR=$(grep "MVC Address:" keypair.txt | awk '{print $3}')
-ID_ADDR=$(grep "ID Address:" keypair.txt | awk '{print $3}')
-PRIV_KEY=$(grep "Private Key (Hex):" keypair.txt | awk '{print $4}')
+# 提取地址信息
+MVC_ADDR=$(grep "MVC地址:" keypair.txt | awk '{print $2}')
+ID_ADDR=$(grep "ID地址:" keypair.txt | awk '{print $2}')
+PRIV_KEY=$(grep "私钥 (Hex):" keypair.txt | awk '{print $3}')
 
 echo "========================================="
-echo "Generated Address Information"
+echo "生成的地址信息"
 echo "========================================="
-echo "MVC Address: $MVC_ADDR"
-echo "ID Address:  $ID_ADDR"
+echo "MVC地址: $MVC_ADDR"
+echo "ID地址:  $ID_ADDR"
 echo ""
 
-# Save to file
+# 保存到文件
 cat > test_account.txt <<EOF
-MVC Test Account Information
-Generated: $(date)
+MVC测试账户信息
+生成时间: $(date)
 
-MVC Address: $MVC_ADDR
-ID Address:  $ID_ADDR
-Private Key: $PRIV_KEY
+MVC地址: $MVC_ADDR
+ID地址:  $ID_ADDR
+私钥:    $PRIV_KEY
 
-⚠️  This is a test account, do not use in production environment
+⚠️  这是测试账户，请勿用于正式环境
 EOF
 
-echo "✓ Account information saved to test_account.txt"
+echo "✓ 账户信息已保存到 test_account.txt"
 echo ""
 
 echo "========================================="
-echo "Next Steps"
+echo "下一步操作"
 echo "========================================="
-echo "1. Send test coins to this address:"
-echo "   MVC Address: $MVC_ADDR"
+echo "1. 向此地址转入测试币:"
+echo "   MVC地址: $MVC_ADDR"
 echo ""
-echo "2. Check balance:"
+echo "2. 查询余额:"
 echo "   ./mvctest balance $MVC_ADDR"
 echo ""
-echo "3. Send transfer (requires balance first):"
-echo "   ./mvctest send $PRIV_KEY <target_address> <amount(satoshi)>"
+echo "3. 发送转账 (需要先有余额):"
+echo "   ./mvctest send $PRIV_KEY <目标地址> <金额(satoshi)>"
 echo ""
-echo "Example:"
+echo "示例:"
 echo "   ./mvctest send $PRIV_KEY 1BoatSLRHtKNngkdXEeobR76b53LETtpyT 100000"
 echo ""
 
-# Cleanup
+# 清理
 rm keypair.txt
 
-echo "Done!"
+echo "完成!"

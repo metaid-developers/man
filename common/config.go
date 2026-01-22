@@ -50,6 +50,7 @@ type syncConfig struct {
 	SyncEndTime   string   `toml:"syncEndTime"`
 	ReSyncNum     int      `toml:"reSyncNum"`
 	IsFullNode    bool     `toml:"isFullNode"`
+	Mrc20Only     bool     `toml:"mrc20Only"` // 只索引 MRC20，不处理其他 PIN 数据
 }
 type Statistics struct {
 	MetaChainHost  string   `toml:"metaChainHost"`

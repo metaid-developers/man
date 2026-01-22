@@ -1,5 +1,5 @@
 chain: btc
-network: testnet
+network: regtest
 wallet_file: btc_wallet.json
 paths:
     - /info/name
@@ -12,3 +12,4 @@ rpc:
     user: test
     password: test
     use_tls: false
+    wallet: metaid-watch

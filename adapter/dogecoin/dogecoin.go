@@ -3,6 +3,7 @@ package dogecoin
 import (
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"manindexer/common"
@@ -50,15 +51,9 @@ func (chain *DogecoinChain) GetBlock(blockHeight int64) (block interface{}, err 
 		return
 	}
 
-	// btcsuite's GetBlock has issues with Dogecoin (witness flag parsing)
-	// Fall back to manual parsing via RPC
-	msgBlock, err := client.GetBlock(blockhash)
-	if err == nil {
-		block = msgBlock
-		return
-	}
-
-	msgBlock, err = chain.getBlockByRPC(blockhash)
+	// Dogecoin uses AuxPoW (merged mining) which btcsuite cannot parse correctly
+	// Always use our custom parser that handles Dogecoin's block format
+	msgBlock, err := chain.getBlockByRPC(blockhash)
 	if err != nil {
 		return
 	}
@@ -233,9 +228,10 @@ func parseHexUint32(hexStr string) (uint32, error) {
 	return val, nil
 }
 
-// getBlockByRPC manually fetches block and individual transactions to avoid btcsuite parsing issues
+// getBlockByRPC fetches block data using verbose mode and parses transactions from raw block
+// This handles Dogecoin's AuxPoW block format which btcsuite cannot parse directly
 func (chain *DogecoinChain) getBlockByRPC(blockhash *chainhash.Hash) (*wire.MsgBlock, error) {
-	// Get block verbose first to get tx list
+	// Get block with verbosity=1 to get tx ids and header info
 	blockVerbose, err := client.GetBlockVerbose(blockhash)
 	if err != nil {
 		return nil, fmt.Errorf("GetBlockVerbose failed: %v", err)
@@ -247,7 +243,7 @@ func (chain *DogecoinChain) getBlockByRPC(blockhash *chainhash.Hash) (*wire.MsgB
 		return nil, fmt.Errorf("failed to parse bits: %v", err)
 	}
 
-	// Build MsgBlock
+	// Build MsgBlock header
 	msgBlock := &wire.MsgBlock{
 		Header: wire.BlockHeader{
 			Version:    blockVerbose.Version,
@@ -260,26 +256,143 @@ func (chain *DogecoinChain) getBlockByRPC(blockhash *chainhash.Hash) (*wire.MsgB
 		Transactions: make([]*wire.MsgTx, 0, len(blockVerbose.Tx)),
 	}
 
-	// Get each transaction individually by txid
-	for _, txid := range blockVerbose.Tx {
-		txhash, err := chainhash.NewHashFromStr(txid)
-		if err != nil {
-			continue
-		}
-
-		txVerbose, err := client.GetRawTransactionVerbose(txhash)
-		if err != nil {
-			continue
-		}
-
-		tx, err := parseTxFromVerbose(txVerbose)
-		if err != nil {
-			continue
-		}
-		msgBlock.Transactions = append(msgBlock.Transactions, tx)
+	// Get raw block hex (verbosity=0) and manually extract transactions
+	blockHexResult, err := client.RawRequest("getblock", []json.RawMessage{
+		json.RawMessage(fmt.Sprintf(`"%s"`, blockhash.String())),
+		json.RawMessage("0"), // verbosity 0 = raw hex
+	})
+	if err != nil {
+		return nil, fmt.Errorf("getblock raw failed: %v", err)
 	}
 
+	var blockHex string
+	if err := json.Unmarshal(blockHexResult, &blockHex); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal block hex: %v", err)
+	}
+
+	blockBytes, err := hex.DecodeString(blockHex)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode block hex: %v", err)
+	}
+
+	// Parse transactions from raw block data
+	// Dogecoin block format: header (80+ bytes with AuxPoW) + varint(txcount) + transactions
+	txs, err := parseDogeBlockTransactions(blockBytes, len(blockVerbose.Tx))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse transactions: %v", err)
+	}
+
+	msgBlock.Transactions = txs
 	return msgBlock, nil
+}
+
+// parseDogeBlockTransactions extracts transactions from raw Dogecoin block data
+// Dogecoin uses AuxPoW which adds extra data after the standard 80-byte header
+func parseDogeBlockTransactions(blockBytes []byte, expectedTxCount int) ([]*wire.MsgTx, error) {
+	// Standard block header is 80 bytes
+	// For AuxPoW blocks (version & 0x100 != 0), there's additional AuxPoW data
+	// We need to find where transactions start
+
+	if len(blockBytes) < 80 {
+		return nil, fmt.Errorf("block too short: %d bytes", len(blockBytes))
+	}
+
+	// Read version from first 4 bytes
+	version := int32(blockBytes[0]) | int32(blockBytes[1])<<8 | int32(blockBytes[2])<<16 | int32(blockBytes[3])<<24
+
+	offset := 80 // Start after standard header
+
+	// Check if this is an AuxPoW block (version has bit 8 set, which is 0x100)
+	if version&0x100 != 0 {
+		// Skip AuxPoW data
+		// AuxPoW structure:
+		// - coinbase tx (variable)
+		// - block hash (32 bytes)
+		// - merkle branch (varint count + 32*count bytes)
+		// - merkle index (4 bytes)
+		// - aux merkle branch (varint count + 32*count bytes)
+		// - aux merkle index (4 bytes)
+		// - parent block header (80 bytes)
+
+		// Parse coinbase transaction
+		coinbaseTx := &wire.MsgTx{}
+		r := bytes.NewReader(blockBytes[offset:])
+		if err := coinbaseTx.BtcDecode(r, 0, wire.BaseEncoding); err != nil {
+			return nil, fmt.Errorf("failed to parse AuxPoW coinbase: %v", err)
+		}
+		offset += len(blockBytes[offset:]) - r.Len()
+
+		// Skip block hash (32 bytes)
+		offset += 32
+
+		// Skip merkle branch
+		branchCount, n := readVarInt(blockBytes[offset:])
+		offset += n + int(branchCount)*32
+
+		// Skip merkle index (4 bytes)
+		offset += 4
+
+		// Skip aux merkle branch
+		auxBranchCount, n := readVarInt(blockBytes[offset:])
+		offset += n + int(auxBranchCount)*32
+
+		// Skip aux merkle index (4 bytes)
+		offset += 4
+
+		// Skip parent block header (80 bytes)
+		offset += 80
+	}
+
+	// Now we're at the transaction count varint
+	txCount, n := readVarInt(blockBytes[offset:])
+	offset += n
+
+	if int(txCount) != expectedTxCount {
+		log.Printf("Warning: parsed tx count %d differs from expected %d", txCount, expectedTxCount)
+	}
+
+	// Parse transactions
+	transactions := make([]*wire.MsgTx, 0, txCount)
+	r := bytes.NewReader(blockBytes[offset:])
+	for i := uint64(0); i < txCount; i++ {
+		tx := &wire.MsgTx{}
+		if err := tx.BtcDecode(r, 0, wire.BaseEncoding); err != nil {
+			return nil, fmt.Errorf("failed to parse tx %d: %v", i, err)
+		}
+		transactions = append(transactions, tx)
+	}
+
+	return transactions, nil
+}
+
+// readVarInt reads a variable-length integer from a byte slice
+// Returns the value and the number of bytes consumed
+func readVarInt(data []byte) (uint64, int) {
+	if len(data) == 0 {
+		return 0, 0
+	}
+
+	first := data[0]
+	switch {
+	case first < 0xfd:
+		return uint64(first), 1
+	case first == 0xfd:
+		if len(data) < 3 {
+			return 0, 0
+		}
+		return uint64(data[1]) | uint64(data[2])<<8, 3
+	case first == 0xfe:
+		if len(data) < 5 {
+			return 0, 0
+		}
+		return uint64(data[1]) | uint64(data[2])<<8 | uint64(data[3])<<16 | uint64(data[4])<<24, 5
+	default: // 0xff
+		if len(data) < 9 {
+			return 0, 0
+		}
+		return uint64(data[1]) | uint64(data[2])<<8 | uint64(data[3])<<16 | uint64(data[4])<<24 |
+			uint64(data[5])<<32 | uint64(data[6])<<40 | uint64(data[7])<<48 | uint64(data[8])<<56, 9
+	}
 }
 
 // Parse transaction from verbose JSON format to wire.MsgTx

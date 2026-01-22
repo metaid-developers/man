@@ -28,7 +28,9 @@
                   <th scope="col">To</th>
                   <th scope="col">Amt</th>
                   <th scope="col">Option</th>
+                  <th scope="col">Direction</th>
                   <th scope="col">TxPoint</th>
+                  <th scope="col">Chain</th>
                   <th scope="col">Status</th>
                   <th scope="col">Verify</th>
                   <th scope="col">Msg</th>
@@ -49,13 +51,40 @@
                     {{ $v.MrcOption }}
                   </td>
                   <td>
+                    {{/* Direction 根据 Status 推导：Status=-1 表示支出，其他表示收入 */}}
+                    {{ if eq $v.Status -1 }}
+                    <span style="color: #ef4444;">↑ Out</span>
+                    {{ else }}
+                    <span style="color: #10b981;">↓ In</span>
+                    {{ end }}
+                  </td>
+                  <td>
                     <a style="text-decoration: underline;" href="/tx/{{ $v.Chain}}/{{$v.TxPoint | outpointToTxId}}"
                        target="_blank">
                       {{ $v.TxPoint | formatAddress }}
                     </a>
                   </td>
                   <td>
+                    {{ if eq $v.Chain "btc" }}
+                    <span style="background: #f7931a; color: white; padding: 2px 6px; border-radius: 4px; font-size: 11px;">BTC</span>
+                    {{ else if eq $v.Chain "doge" }}
+                    <span style="background: #c3a634; color: white; padding: 2px 6px; border-radius: 4px; font-size: 11px;">DOGE</span>
+                    {{ else if eq $v.Chain "mvc" }}
+                    <span style="background: #5c6bc0; color: white; padding: 2px 6px; border-radius: 4px; font-size: 11px;">MVC</span>
+                    {{ else }}
+                    <span style="background: #6b7280; color: white; padding: 2px 6px; border-radius: 4px; font-size: 11px;">{{ $v.Chain }}</span>
+                    {{ end }}
+                  </td>
+                  <td>
+                    {{ if eq $v.Status 0 }}
+                    <span style="color: #10b981;">Available</span>
+                    {{ else if eq $v.Status -1 }}
+                    <span style="color: #ef4444;">Spent</span>
+                    {{ else if eq $v.Status 1 }}
+                    <span style="color: #f59e0b;">Teleport Pending</span>
+                    {{ else }}
                     {{ $v.Status }}
+                    {{ end }}
                   </td>
                   <td>
                     {{ $v.Verify }}
