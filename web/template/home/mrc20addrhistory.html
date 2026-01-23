@@ -30,76 +30,58 @@
             <table class="table table-hover">
               <thead>
                 <tr>
+                  <th scope="col">Height</th>
                   <th scope="col">TxPoint</th>
                   <th scope="col">Operation</th>
-                  <th scope="col">Direction</th>
+                  <th scope="col">From</th>
+                  <th scope="col">To</th>
                   <th scope="col">Amount</th>
                   <th scope="col">Status</th>
-                  <th scope="col">OperationTx</th>
-                  <th scope="col">Chain</th>
-                  <th scope="col">Height</th>
+                  <th scope="col">Msg</th>
                 </tr>
               </thead>
 
               <tbody>
-                {{ range .List }}
+                {{ range $v := .List }}
                 <tr>
-                  <td style="word-break: break-all; max-width: 250px; font-size: 12px;">{{ .TxPoint }}</td>
+                  <td>{{ $v.BlockHeight }}</td>
+                  <td style="word-break: break-all; max-width: 180px; font-size: 12px;">
+                    <a href="/tx/{{ $v.Chain}}/{{$v.TxId}}" style="color: #3b82f6;">{{ $v.TxPoint | formatAddress }}</a>
+                  </td>
                   <td>
-                    {{ if eq .MrcOption "mint" }}
+                    {{ if eq $v.TxType "mint" }}
                     <span style="background: #10b981; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">Mint</span>
-                    {{ else if eq .MrcOption "pre-mint" }}
-                    <span style="background: #059669; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">Pre-Mint</span>
-                    {{ else if eq .MrcOption "deploy" }}
-                    <span style="background: #3b82f6; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">Deploy</span>
-                    {{ else if eq .MrcOption "data-transfer" }}
-                    <span style="background: #f59e0b; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">Data Transfer</span>
-                    {{ else if eq .MrcOption "native-transfer" }}
+                    {{ else if eq $v.TxType "transfer" }}
+                    <span style="background: #f59e0b; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">Transfer</span>
+                    {{ else if eq $v.TxType "data-transfer" }}
+                    <span style="background: #f59e0b; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">Transfer</span>
+                    {{ else if eq $v.TxType "native_transfer" }}
                     <span style="background: #eab308; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">Native Transfer</span>
-                    {{ else if eq .MrcOption "teleport-transfer" }}
-                    <span style="background: #8b5cf6; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">Teleport</span>
+                    {{ else if eq $v.TxType "deploy" }}
+                    <span style="background: #3b82f6; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">Deploy</span>
+                    {{ else if eq $v.TxType "teleport_pending" }}
+                    <span style="background: #f97316; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">Teleport Pending</span>
+                    {{ else if eq $v.TxType "teleport_out" }}
+                    <span style="background: #8b5cf6; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">Teleport Out</span>
+                    {{ else if eq $v.TxType "teleport_in" }}
+                    <span style="background: #a855f7; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">Teleport In</span>
                     {{ else }}
-                    <span style="background: #6b7280; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">{{ .MrcOption }}</span>
+                    <span style="background: #6b7280; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">{{ $v.TxType }}</span>
                     {{ end }}
                   </td>
+                  <td style="font-size: 12px;">{{ $v.FromAddress | formatAddress }}</td>
+                  <td style="font-size: 12px;">{{ $v.ToAddress | formatAddress }}</td>
+                  <td>{{ $v.Amount }}</td>
                   <td>
-                    {{ if eq .Direction "in" }}
-                    <span style="color: #10b981;">↓ In</span>
+                    {{ if eq $v.Status 1 }}
+                    <span style="color: #10b981;">Success</span>
+                    {{ else if eq $v.Status -1 }}
+                    <span style="color: #ef4444;">Failed</span>
                     {{ else }}
-                    <span style="color: #ef4444;">↑ Out</span>
+                    <span style="color: #6b7280;">Unknown</span>
                     {{ end }}
                   </td>
-                  <td>{{ .AmtChange }}</td>
-                  <td>
-                    {{ if eq .Status 0 }}
-                    <span style="color: #10b981;">Available</span>
-                    {{ else if eq .Status -1 }}
-                    <span style="color: #ef4444;">Spent</span>
-                    {{ else if eq .Status 1 }}
-                    <span style="color: #f59e0b;">Teleport Pending</span>
-                    {{ else }}
-                    {{ .Status }}
-                    {{ end }}
-                  </td>
-                  <td style="word-break: break-all; max-width: 200px; font-size: 11px;">
-                    {{ if .OperationTx }}
-                    <a href="https://mempool.space/tx/{{ .OperationTx }}" target="_blank" style="color: #3b82f6;">{{ slice .OperationTx 0 16 }}...</a>
-                    {{ else }}
-                    -
-                    {{ end }}
-                  </td>
-                  <td>
-                    {{ if eq .Chain "btc" }}
-                    <span style="background: #f7931a; color: white; padding: 2px 6px; border-radius: 4px; font-size: 11px;">BTC</span>
-                    {{ else if eq .Chain "doge" }}
-                    <span style="background: #c3a634; color: white; padding: 2px 6px; border-radius: 4px; font-size: 11px;">DOGE</span>
-                    {{ else if eq .Chain "mvc" }}
-                    <span style="background: #5c6bc0; color: white; padding: 2px 6px; border-radius: 4px; font-size: 11px;">MVC</span>
-                    {{ else }}
-                    <span style="background: #6b7280; color: white; padding: 2px 6px; border-radius: 4px; font-size: 11px;">{{ .Chain }}</span>
-                    {{ end }}
-                  </td>
-                  <td>{{ .BlockHeight }}</td>
+                  <td style="font-size: 11px; max-width: 200px;">{{ $v.Msg }}</td>
                 </tr>
                 {{ end }}
               </tbody>

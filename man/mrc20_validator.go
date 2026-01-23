@@ -555,6 +555,8 @@ func countLeadingZeros(str string) int {
 }
 
 func (validator *Mrc20Validator) Transfer(content []mrc20.Mrc20TranferData, pinNode *pin.PinInscription, isMempool bool) (toAddress map[int]string, utxoList []*mrc20.Mrc20Utxo, outputValueList []int64, msg string, firstIdx int, err error) {
+	log.Printf("[DEBUG] Validator.Transfer START: pinId=%s, tx=%s, contentLen=%d", pinNode.Id, pinNode.GenesisTransaction, len(content))
+
 	if len(content) <= 0 {
 		err = errors.New(mrc20.ErrTranferReqData)
 		msg = mrc20.ErrTranferReqData
@@ -581,6 +583,7 @@ func (validator *Mrc20Validator) Transfer(content []mrc20.Mrc20TranferData, pinN
 
 		tick, err1 := PebbleStore.GetMrc20TickInfo(item.Id, "")
 		if err1 != nil {
+			log.Printf("[DEBUG] Validator.Transfer: GetMrc20TickInfo failed, tickId=%s, err=%v", item.Id, err1)
 			err = errors.New(mrc20.ErrMintTickIdNull)
 			msg = mrc20.ErrMintTickIdNull
 			return
@@ -624,13 +627,19 @@ func (validator *Mrc20Validator) Transfer(content []mrc20.Mrc20TranferData, pinN
 		s := fmt.Sprintf("%s:%d", in.PreviousOutPoint.Hash.String(), in.PreviousOutPoint.Index)
 		inputList = append(inputList, s)
 	}
+	log.Printf("[DEBUG] Validator.Transfer: looking up input UTXOs, inputList=%v", inputList)
+
 	list, err := PebbleStore.GetMrc20UtxoByOutPutList(inputList, isMempool)
 	if err != nil {
 		log.Println("GetMrc20UtxoByOutPutList:", err, isMempool)
 		return
 	}
+	log.Printf("[DEBUG] Validator.Transfer: found %d UTXOs in inputs", len(list))
+
 	inMap := make(map[string]decimal.Decimal)
 	for _, item := range list {
+		log.Printf("[DEBUG] Validator.Transfer: input UTXO found - txPoint=%s, tickId=%s, amt=%s",
+			item.TxPoint, item.Mrc20Id, item.AmtChange.String())
 		inMap[item.Mrc20Id] = inMap[item.Mrc20Id].Add(item.AmtChange)
 		utxoList = append(utxoList, item)
 	}
@@ -639,11 +648,13 @@ func (validator *Mrc20Validator) Transfer(content []mrc20.Mrc20TranferData, pinN
 		if in, ok := inMap[k]; ok {
 			//in < v
 			if in.Compare(v) == -1 {
+				log.Printf("[DEBUG] Validator.Transfer: input amount %s < output amount %s for tickId %s", in.String(), v.String(), k)
 				msg = "The total input amount is less than the output"
 				err = errors.New("valueErr")
 				return
 			}
 		} else {
+			log.Printf("[DEBUG] Validator.Transfer: tickId %s not found in inputs, outMap keys=%v, inMap keys=%v", k, outMap, inMap)
 			msg = "No available tick in the input"
 			err = errors.New("valueErr")
 			return

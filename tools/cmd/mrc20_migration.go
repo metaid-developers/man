@@ -284,17 +284,156 @@ func migrateUtxoData(mongoClient *mongo.Client, pebbleDB *pebblestore.Database, 
 		log.Printf("  Found %d operation transactions", len(opTxHeightMap))
 	}
 
-	// 构建查询条件
-	filter := bson.M{"chain": *chainName}
+	// ========== 第一步：读取所有 UTXO，生成完整 Transaction 历史 ==========
+	log.Printf("\n  Step 1: Building complete transaction history from all UTXOs...")
+
+	// 第一遍：读取所有 UTXO（包括 spent 的和验证失败的），构建 Transaction 历史
+	filter1 := bson.M{"chain": *chainName}
 	if *endHeight > 0 {
-		// 只迁移 blockheight < endHeight 的数据
-		filter["blockheight"] = bson.M{"$lt": *endHeight}
-		log.Printf("  Filtering UTXO with blockheight < %d", *endHeight)
+		filter1["blockheight"] = bson.M{"$lt": *endHeight}
 	}
 
-	// 获取所有 UTXO（包括已花费的）
-	// 注意：status=-1 表示已花费，但仍需存储用于历史查询
-	// verify=false 的记录是无效操作，仍然需要存储以防止重复处理
+	cursor1, err := collection.Find(context.Background(), filter1)
+	if err != nil {
+		return err
+	}
+
+	// 新架构：尝试重建 Transaction 历史（从所有 UTXO）
+	// 每条 UTXO 都对应一条流水记录（即使是同一笔交易的多个输出）
+	transactionList := []*mrc20.Mrc20Transaction{}
+	txPointMap := make(map[string]bool) // txPoint -> 是否已处理，避免重复
+	nextTxIndex := int64(1)
+
+	allUtxoCount := 0
+	for cursor1.Next(context.Background()) {
+		var utxo map[string]interface{}
+		if err := cursor1.Decode(&utxo); err != nil {
+			continue
+		}
+		allUtxoCount++
+
+		// 提取字段
+		txPoint, _ := utxo["txpoint"].(string)
+		if txPoint == "" {
+			continue
+		}
+		parts := strings.Split(txPoint, ":")
+		if len(parts) != 2 {
+			continue
+		}
+		txId := parts[0]
+
+		// 跳过重复的 txPoint（同一个 UTXO 不重复记录）
+		if txPointMap[txPoint] {
+			continue
+		}
+		txPointMap[txPoint] = true
+
+		mrcOption, _ := utxo["mrcoption"].(string)
+		tick, _ := utxo["tick"].(string)
+		mrc20Id, _ := utxo["mrc20id"].(string)
+		pinId, _ := utxo["pinid"].(string)
+		toAddress, _ := utxo["toaddress"].(string)
+		fromAddress, _ := utxo["fromaddress"].(string)
+		blockHeight, _ := utxo["blockheight"].(int64)
+		timestamp, _ := utxo["timestamp"].(int64)
+
+		// 解析金额
+		var amount decimal.Decimal
+		if amtChangeRaw, ok := utxo["amtchange"]; ok {
+			switch v := amtChangeRaw.(type) {
+			case string:
+				amount, _ = decimal.NewFromString(v)
+			case primitive.Decimal128:
+				amount, _ = decimal.NewFromString(v.String())
+			case float64:
+				amount = decimal.NewFromFloat(v)
+			case int64:
+				amount = decimal.NewFromInt(v)
+			}
+		}
+
+		// 根据 MrcOption 生成 Transaction 记录
+		// 注意：历史数据的 mrcoption 可能为空，默认当作 transfer 处理
+		var txType string
+		switch mrcOption {
+		case "mint":
+			txType = "mint"
+		case "deploy":
+			txType = "deploy"
+		case "pre-mint":
+			txType = "pre-mint"
+		case "transfer", "data-transfer", "native-transfer", "":
+			// 空值、transfer、data-transfer、native-transfer 都当作 transfer
+			txType = "transfer"
+		default:
+			// 其他操作（teleport 等）跳过
+			continue
+		}
+
+		// 获取验证状态和消息
+		verify, _ := utxo["verify"].(bool)
+		msg, _ := utxo["msg"].(string) // 消息字段是 msg，不是 verifymsg
+		txStatus := -1                 // 默认失败
+		if verify {
+			txStatus = 1 // 验证成功
+		}
+
+		tx := &mrc20.Mrc20Transaction{
+			Chain:        *chainName,
+			TxId:         txId,
+			TxPoint:      txPoint,
+			TxIndex:      nextTxIndex,
+			PinId:        pinId,
+			TickId:       mrc20Id,
+			Tick:         tick,
+			TxType:       txType,
+			FromAddress:  fromAddress,
+			ToAddress:    toAddress,
+			Amount:       amount,
+			SpentUtxos:   "[]",
+			CreatedUtxos: fmt.Sprintf("[\"%s\"]", txPoint),
+			BlockHeight:  blockHeight,
+			Timestamp:    timestamp,
+			Msg:          msg,
+			Status:       txStatus,
+			RelatedChain: "",
+			RelatedTxId:  "",
+			RelatedPinId: "",
+		}
+
+		transactionList = append(transactionList, tx)
+		nextTxIndex++
+	}
+	cursor1.Close(context.Background())
+
+	log.Printf("  → Found %d UTXOs (all statuses)", allUtxoCount)
+	log.Printf("  → Generated %d transaction records", len(transactionList))
+
+	// ========== 第二步：迁移可用 UTXO 和生成 AccountBalance ==========
+	// 重要：需要迁移两类 UTXO：
+	// 1. status=0 的 UTXO（当前可用）
+	// 2. status=-1 但 operationtx 的高度 >= end-height 的 UTXO（在 end-height 之后才被消费，需要恢复）
+	log.Printf("\n  Step 2: Migrating available UTXOs (status=0) and recovering UTXOs spent after end-height...")
+
+	// 构建查询条件：
+	// - status=0 且 blockheight < end-height（当前可用的 UTXO）
+	// - 或者 status=-1 且 blockheight < end-height（已消费的 UTXO，后面会检查是否需要恢复）
+	var filter bson.M
+	if *endHeight > 0 {
+		filter = bson.M{
+			"chain":       *chainName,
+			"verify":      true,
+			"blockheight": bson.M{"$lt": *endHeight},
+			"$or": []bson.M{
+				{"status": 0},  // 可用的 UTXO
+				{"status": -1}, // 已消费的 UTXO（需要检查是否应该恢复）
+			},
+		}
+	} else {
+		filter = bson.M{"chain": *chainName, "status": 0, "verify": true}
+	}
+
 	cursor, err := collection.Find(context.Background(), filter)
 	if err != nil {
 		return err
@@ -308,13 +447,13 @@ func migrateUtxoData(mongoClient *mongo.Client, pebbleDB *pebblestore.Database, 
 
 	// 统计
 	count := int64(0)
-	spentCount := int64(0)   // status=-1 的数量
-	unspentCount := int64(0) // status=0 的数量
-	invalidCount := int64(0) // verify=false 的数量
-	resetCount := int64(0)   // 重置状态的数量
 	addressMap := make(map[string]bool)
 	shovelMap := make(map[string]string)  // mrc20id_pinid -> mintPinId
 	operationMap := make(map[string]bool) // Track operation tx
+
+	// 新架构：余额聚合（只从 status=0 的 UTXO 计算）
+	// key: chain_address_tickId
+	balanceMap := make(map[string]*mrc20.Mrc20AccountBalance)
 
 	for cursor.Next(context.Background()) {
 		var utxo map[string]interface{}
@@ -323,29 +462,12 @@ func migrateUtxoData(mongoClient *mongo.Client, pebbleDB *pebblestore.Database, 
 			continue
 		}
 
-		// 统计验证状态
-		if verify, ok := utxo["verify"].(bool); ok && !verify {
-			invalidCount++
-		}
-
-		// 统计花费状态
-		if status, ok := utxo["status"]; ok {
-			statusInt := toInt(status)
-			if statusInt == -1 {
-				spentCount++
-			} else {
-				unspentCount++
-			}
-		}
-
 		// 提取 shovel 数据（mint 操作使用的 PIN）
-		// 只有 mint 操作才有 shovel，并且需要 verify=true
 		if mrcoption, ok := utxo["mrcoption"].(string); ok && mrcoption == "mint" {
 			if verify, ok := utxo["verify"].(bool); ok && verify {
 				if mrc20id, ok := utxo["mrc20id"].(string); ok && mrc20id != "" {
 					if pinid, ok := utxo["pinid"].(string); ok && pinid != "" {
 						shovelKey := mrc20id + "_" + pinid
-						// 存储实际的 mint PIN ID
 						shovelMap[shovelKey] = pinid
 					}
 				}
@@ -353,17 +475,12 @@ func migrateUtxoData(mongoClient *mongo.Client, pebbleDB *pebblestore.Database, 
 		}
 
 		// 提取 operation tx
-		// 只添加 height < end-height 的 operationTx
-		// 这样 height >= end-height 的交易可以被重新索引
 		if optx, ok := utxo["operationtx"].(string); ok && optx != "" {
 			if *endHeight > 0 {
-				// 检查 operationTx 的高度是否 < end-height
 				if opHeight, ok := opTxHeightMap[optx]; ok && opHeight < *endHeight {
 					operationMap[optx] = true
 				}
-				// 如果 opHeight >= endHeight，不添加到 operationMap，让索引器重新处理
 			} else {
-				// 没有 end-height 限制时，添加所有
 				operationMap[optx] = true
 			}
 		}
@@ -385,42 +502,80 @@ func migrateUtxoData(mongoClient *mongo.Client, pebbleDB *pebblestore.Database, 
 			continue
 		}
 
-		// 智能重置已消费 UTXO 的状态
-		// 只有当 operationTx 的区块高度 >= end-height 时才重置
-		// 这样可以保证：
-		// - 在 end-height 之前被消费的 UTXO 保持 status=-1
-		// - 在 end-height 之后被消费的 UTXO 重置为 status=0，让索引器重新处理
-		if *endHeight > 0 && utxoData.Status == -1 && utxoData.OperationTx != "" {
-			if opHeight, ok := opTxHeightMap[utxoData.OperationTx]; ok && opHeight >= *endHeight {
-				utxoData.Status = 0
-				utxoData.OperationTx = "" // 清除操作交易，让索引器重新设置
-				resetCount++
+		// 如果指定了 end-height，检查 status=-1 的 UTXO 是否需要恢复
+		// 如果 operationtx 的高度 >= endHeight，说明这个 UTXO 在目标高度时还是可用的
+		if *endHeight > 0 && utxoData.Status == -1 {
+			if utxoData.OperationTx != "" {
+				if opHeight, ok := opTxHeightMap[utxoData.OperationTx]; ok {
+					if opHeight >= *endHeight {
+						// operationtx 高度 >= endHeight，恢复为可用状态
+						log.Printf("Restoring UTXO %s: consumed at height %d (>= endHeight %d), restoring to status=0",
+							utxoData.TxPoint, opHeight, *endHeight)
+						utxoData.Status = 0
+						utxoData.OperationTx = "" // 清除消费交易
+					} else {
+						// operationtx 高度 < endHeight，确实已消费，跳过
+						log.Printf("Skipping consumed UTXO %s: consumed at height %d (< endHeight %d)",
+							utxoData.TxPoint, opHeight, *endHeight)
+						continue
+					}
+				} else {
+					// operationtx 不在 opTxHeightMap 中，可能是无效的，跳过
+					log.Printf("Warning: UTXO %s has operationtx %s but height not found, skipping",
+						utxoData.TxPoint, utxoData.OperationTx)
+					continue
+				}
+			} else {
+				// status=-1 但没有 operationtx，异常情况，跳过
+				log.Printf("Warning: UTXO %s has status=-1 but no operationtx, skipping", utxoData.TxPoint)
+				continue
 			}
 		}
 
-		// Save to PebbleDB
-		utxoBytes, _ := sonic.Marshal(utxoData)
+		// 新架构：聚合余额
+		balanceKey := fmt.Sprintf("%s_%s_%s", utxoData.Chain, utxoData.ToAddress, utxoData.Mrc20Id)
+		if balance, exists := balanceMap[balanceKey]; exists {
+			balance.Balance = balance.Balance.Add(utxoData.AmtChange)
+			balance.UtxoCount += 1
+			if utxoData.BlockHeight > balance.LastUpdateHeight {
+				balance.LastUpdateHeight = utxoData.BlockHeight
+				balance.LastUpdateTime = utxoData.Timestamp
+				balance.LastUpdateTx = utxoData.OperationTx
+			}
+		} else {
+			balanceMap[balanceKey] = &mrc20.Mrc20AccountBalance{
+				Chain:            utxoData.Chain,
+				Address:          utxoData.ToAddress,
+				TickId:           utxoData.Mrc20Id,
+				Tick:             utxoData.Tick,
+				Balance:          utxoData.AmtChange,
+				PendingOut:       decimal.Zero,
+				PendingIn:        decimal.Zero,
+				LastUpdateTx:     utxoData.OperationTx,
+				LastUpdateHeight: utxoData.BlockHeight,
+				LastUpdateTime:   utxoData.Timestamp,
+				UtxoCount:        1,
+			}
+		}
 
-		// Save UTXO by TxPoint
+		// Save UTXO to PebbleDB (新架构：只保存 status=0 的可用 UTXO)
+		utxoBytes, _ := sonic.Marshal(utxoData)
 		key := []byte("mrc20_utxo_" + utxoData.TxPoint)
 		batch.Set(key, utxoBytes, pebble.Sync)
 
-		// 双前缀地址索引:
-		// - mrc20_in_{ToAddress}: 收入记录，用于余额计算
-		// - mrc20_out_{ToAddress}: 支出记录，仅在 Status=-1 时创建
-
-		// 收入索引：所有记录都写入 mrc20_in_{ToAddress}
+		// 收入索引: mrc20_in_{address}_{tickId}_{txPoint}
 		if utxoData.ToAddress != "" {
 			inKey := fmt.Sprintf("mrc20_in_%s_%s_%s",
 				utxoData.ToAddress, utxoData.Mrc20Id, utxoData.TxPoint)
 			batch.Set([]byte(inKey), utxoBytes, pebble.Sync)
 		}
 
-		// 支出索引：仅当 Status=-1（已消耗）时写入 mrc20_out_{ToAddress}
-		if utxoData.Status == -1 && utxoData.ToAddress != "" {
-			outKey := fmt.Sprintf("mrc20_out_%s_%s_%s",
-				utxoData.ToAddress, utxoData.Mrc20Id, utxoData.TxPoint)
-			batch.Set([]byte(outKey), utxoBytes, pebble.Sync)
+		// 可用 UTXO 索引: available_utxo_{chain}_{address}_{tickId}_{txPoint}
+		// 这是新架构的核心索引，用于快速查询可用 UTXO
+		if utxoData.ToAddress != "" && utxoData.Status == 0 {
+			availableKey := fmt.Sprintf("available_utxo_%s_%s_%s_%s",
+				utxoData.Chain, utxoData.ToAddress, utxoData.Mrc20Id, utxoData.TxPoint)
+			batch.Set([]byte(availableKey), utxoBytes, pebble.Sync)
 		}
 
 		count++
@@ -429,7 +584,7 @@ func migrateUtxoData(mongoClient *mongo.Client, pebbleDB *pebblestore.Database, 
 				return err
 			}
 			batch = pebbleDB.MrcDb.NewBatch()
-			fmt.Printf("\r  Processed %d UTXOs...", count)
+			fmt.Printf("\r  Processed %d available UTXOs...", count)
 		}
 	}
 
@@ -439,8 +594,95 @@ func migrateUtxoData(mongoClient *mongo.Client, pebbleDB *pebblestore.Database, 
 		}
 	}
 
-	// 保存 shovel 数据（从 UTXO 中提取的 mint PIN）
-	// Shovel 需要存储完整结构
+	// 新架构：保存 AccountBalance
+	// 注意：索引键格式必须与 man/mrc20_new_methods.go 中的 SaveMrc20AccountBalance 一致
+	// 格式: balance_{chain}_{address}_{tickId}
+	if !*dryRun && len(balanceMap) > 0 {
+		log.Printf("\n  Saving %d account balances...", len(balanceMap))
+		balanceBatch := pebbleDB.MrcDb.NewBatch()
+		balanceCount := 0
+		for _, balance := range balanceMap {
+			data, _ := sonic.Marshal(balance)
+			// 正确的格式: balance_{chain}_{address}_{tickId}
+			key := fmt.Sprintf("balance_%s_%s_%s", balance.Chain, balance.Address, balance.TickId)
+			balanceBatch.Set([]byte(key), data, pebble.Sync)
+			balanceCount++
+			if balanceCount%*batchSize == 0 {
+				if err := balanceBatch.Commit(pebble.Sync); err != nil {
+					return err
+				}
+				balanceBatch = pebbleDB.MrcDb.NewBatch()
+				fmt.Printf("\r  Saved %d balances...", balanceCount)
+			}
+		}
+		if balanceBatch.Count() > 0 {
+			if err := balanceBatch.Commit(pebble.Sync); err != nil {
+				return err
+			}
+		}
+		log.Printf("\n✓ Saved %d account balances", len(balanceMap))
+	}
+
+	// 新架构：保存 Transaction 历史（尽力而为）
+	// 注意：索引键格式必须与 man/mrc20_new_methods.go 中的 SaveMrc20Transaction 一致
+	if !*dryRun && len(transactionList) > 0 {
+		log.Printf("\n  Saving %d transaction records (reconstructed from UTXOs)...", len(transactionList))
+		txBatch := pebbleDB.MrcDb.NewBatch()
+		txCount := 0
+		for _, tx := range transactionList {
+			data, _ := sonic.Marshal(tx)
+
+			// 从 CreatedUtxos 中提取 txPoint 作为主键的一部分
+			// CreatedUtxos 格式: ["txid:vout"]
+			txPointForKey := tx.TxId // fallback
+			if tx.CreatedUtxos != "" && tx.CreatedUtxos != "[]" {
+				var utxos []string
+				if err := sonic.UnmarshalString(tx.CreatedUtxos, &utxos); err == nil && len(utxos) > 0 {
+					txPointForKey = utxos[0]
+				}
+			}
+
+			// 主键: tx_{chain}_{txPoint}
+			// txPoint 是全局唯一的，可以直接作为主键
+			key := []byte(fmt.Sprintf("tx_%s_%s", tx.Chain, txPointForKey))
+			txBatch.Set(key, data, pebble.Sync)
+
+			// 按 tick 查历史索引: tx_tick_{chain}_{tickId}_{blockHeight}_{timestamp}_{txPoint}
+			tickKey := []byte(fmt.Sprintf("tx_tick_%s_%s_%012d_%012d_%s", tx.Chain, tx.TickId, tx.BlockHeight, tx.Timestamp, txPointForKey))
+			txBatch.Set(tickKey, key, pebble.Sync)
+
+			// From 索引: tx_from_{chain}_{fromAddress}_{tickId}_{blockHeight}_{timestamp}_{txPoint}
+			if tx.FromAddress != "" {
+				fromKey := []byte(fmt.Sprintf("tx_from_%s_%s_%s_%012d_%012d_%s", tx.Chain, tx.FromAddress, tx.TickId, tx.BlockHeight, tx.Timestamp, txPointForKey))
+				txBatch.Set(fromKey, key, pebble.Sync)
+			}
+
+			// To 索引: tx_to_{chain}_{toAddress}_{tickId}_{blockHeight}_{timestamp}_{txPoint}
+			if tx.ToAddress != "" {
+				toKey := []byte(fmt.Sprintf("tx_to_%s_%s_%s_%012d_%012d_%s", tx.Chain, tx.ToAddress, tx.TickId, tx.BlockHeight, tx.Timestamp, txPointForKey))
+				txBatch.Set(toKey, key, pebble.Sync)
+			}
+
+			txCount++
+			if txCount%*batchSize == 0 {
+				if err := txBatch.Commit(pebble.Sync); err != nil {
+					return err
+				}
+				txBatch = pebbleDB.MrcDb.NewBatch()
+				fmt.Printf("\r  Saved %d transactions...", txCount)
+			}
+		}
+
+		if txBatch.Count() > 0 {
+			if err := txBatch.Commit(pebble.Sync); err != nil {
+				return err
+			}
+		}
+		log.Printf("\n✓ Saved %d transaction records", len(transactionList))
+		log.Printf("  Note: Transaction history reconstructed from UTXOs (mint/deploy/transfer)")
+	}
+
+	// 保存 shovel 数据
 	if !*dryRun && len(shovelMap) > 0 {
 		shovelBatch := pebbleDB.MrcDb.NewBatch()
 		for shovelKey, mintPinId := range shovelMap {
@@ -456,7 +698,6 @@ func migrateUtxoData(mongoClient *mongo.Client, pebbleDB *pebblestore.Database, 
 				Mrc20MintPin: mintPinId,
 			}
 			data, _ := sonic.Marshal(shovel)
-
 			key := []byte("mrc20_shovel_" + mrc20Id + "_" + pinId)
 			shovelBatch.Set(key, data, pebble.Sync)
 		}
@@ -465,7 +706,7 @@ func migrateUtxoData(mongoClient *mongo.Client, pebbleDB *pebblestore.Database, 
 		}
 	}
 
-	// 保存 operation tx 数据（从 UTXO 中提取）
+	// 保存 operation tx 数据
 	if !*dryRun && len(operationMap) > 0 {
 		opBatch := pebbleDB.MrcDb.NewBatch()
 		for opTx := range operationMap {
@@ -482,16 +723,13 @@ func migrateUtxoData(mongoClient *mongo.Client, pebbleDB *pebblestore.Database, 
 	stats.ShovelCount = int64(len(shovelMap))
 	stats.OperationCount = int64(len(operationMap))
 
-	log.Printf("\n✓ Migrated %d UTXOs total:", count)
-	log.Printf("  → Unspent (status=0):  %d", unspentCount)
-	log.Printf("  → Spent (status=-1):   %d", spentCount)
-	if resetCount > 0 {
-		log.Printf("  → Reset for re-index:  %d (operationTx height >= %d)", resetCount, *endHeight)
-	}
-	log.Printf("  → Invalid (verify=false): %d", invalidCount)
-	log.Printf("  → Unique addresses:    %d", len(addressMap))
-	log.Printf("  → Extracted shovels:   %d", len(shovelMap))
-	log.Printf("  → Extracted op txs:    %d", len(operationMap))
+	log.Printf("\n✓ Migration Summary:")
+	log.Printf("  → Available UTXOs (status=0): %d", count)
+	log.Printf("  → Unique addresses:           %d", len(addressMap))
+	log.Printf("  → Account balances:           %d", len(balanceMap))
+	log.Printf("  → Transaction records:        %d (all operations)", len(transactionList))
+	log.Printf("  → Extracted shovels:          %d", len(shovelMap))
+	log.Printf("  → Extracted op txs:           %d", len(operationMap))
 	return nil
 }
 

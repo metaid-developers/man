@@ -14,14 +14,24 @@ import (
 )
 
 // SaveMrc20Pin 保存 MRC20 PIN 数据
-// 使用双前缀索引：
-// - mrc20_in_{ToAddress}_{mrc20Id}_{TxPoint}: 收入记录，用于余额计算
-// - mrc20_out_{ToAddress}_{mrc20Id}_{TxPoint}: 支出记录，仅在 Status=-1 时创建
+// 根据新架构设计：
+// - UTXO 表只保留 status=0 (Available) 和 status=1/2 (Pending) 的记录
+// - status=-1 (Spent) 的 UTXO 应该通过 DeleteMrc20Utxo 删除，不应该通过此方法保存
+// 索引：
+// - mrc20_utxo_{txPoint}: UTXO 主记录
+// - mrc20_in_{ToAddress}_{mrc20Id}_{txPoint}: 地址收入索引
+// - available_utxo_{chain}_{address}_{tickId}_{txPoint}: 可用 UTXO 专用索引 (只存储 status=0)
 func (pd *PebbleData) SaveMrc20Pin(utxoList []mrc20.Mrc20Utxo) error {
 	batch := pd.Database.MrcDb.NewBatch()
 	defer batch.Close()
 
 	for _, utxo := range utxoList {
+		// 跳过 status=-1 的记录，Spent UTXO 不应该通过此方法保存
+		if utxo.Status == mrc20.UtxoStatusSpent {
+			log.Printf("[WARN] SaveMrc20Pin: skipping spent UTXO %s, use DeleteMrc20Utxo instead", utxo.TxPoint)
+			continue
+		}
+
 		// 保存 UTXO 数据
 		// Key: mrc20_utxo_{txPoint}
 		data, err := sonic.Marshal(utxo)
@@ -46,13 +56,13 @@ func (pd *PebbleData) SaveMrc20Pin(utxoList []mrc20.Mrc20Utxo) error {
 			}
 		}
 
-		// 支出索引：仅当 Status=-1（已消耗）时，写入 mrc20_out_{ToAddress}
-		// ToAddress 在这种情况下是发送者/原持有者
-		if utxo.Status == mrc20.UtxoStatusSpent && utxo.ToAddress != "" {
-			outKey := fmt.Sprintf("mrc20_out_%s_%s_%s", utxo.ToAddress, utxo.Mrc20Id, utxo.TxPoint)
-			err = batch.Set([]byte(outKey), data, pebble.Sync)
+		// 可用 UTXO 专用索引：只有 status=0 的 UTXO 写入此索引
+		// 用于快速查询某地址某 tick 的可用 UTXO
+		if utxo.Status == mrc20.UtxoStatusAvailable && utxo.ToAddress != "" {
+			availableKey := fmt.Sprintf("available_utxo_%s_%s_%s_%s", utxo.Chain, utxo.ToAddress, utxo.Mrc20Id, utxo.TxPoint)
+			err = batch.Set([]byte(availableKey), data, pebble.Sync)
 			if err != nil {
-				log.Println("Set mrc20 spend index error:", err)
+				log.Println("Set available utxo index error:", err)
 			}
 		}
 	}
@@ -243,44 +253,76 @@ func (pd *PebbleData) GetMrc20UtxoByOutPutList(outputList []string, isMempool bo
 	return result, nil
 }
 
-// UpdateMrc20Utxo 更新 MRC20 UTXO（用于转账）
-// 使用双前缀索引：
-// - mrc20_in_{ToAddress}_{mrc20Id}_{TxPoint}: 收入记录，用于余额计算和接收历史
-// - mrc20_out_{ToAddress}_{mrc20Id}_{TxPoint}: 支出记录，仅在 Status=-1 时创建
+// UpdateMrc20Utxo 更新 MRC20 UTXO（用于转账和状态变更）
+// 根据新架构设计：
+// - status=0 (Available): 保存到 UTXO 表和 available_utxo 索引
+// - status=1/2 (Pending): 保存到 UTXO 表，从 available_utxo 索引删除
+// - status=-1 (Spent): 从 UTXO 表和所有索引中删除
 func (pd *PebbleData) UpdateMrc20Utxo(utxoList []*mrc20.Mrc20Utxo, isMempool bool) error {
 	batch := pd.Database.MrcDb.NewBatch()
 	defer batch.Close()
 
 	for _, utxo := range utxoList {
-		data, err := sonic.Marshal(utxo)
-		if err != nil {
-			log.Println("Marshal mrc20 utxo error:", err)
-			continue
-		}
+		mainKey := fmt.Sprintf("mrc20_utxo_%s", utxo.TxPoint)
+		inKey := fmt.Sprintf("mrc20_in_%s_%s_%s", utxo.ToAddress, utxo.Mrc20Id, utxo.TxPoint)
+		availableKey := fmt.Sprintf("available_utxo_%s_%s_%s_%s", utxo.Chain, utxo.ToAddress, utxo.Mrc20Id, utxo.TxPoint)
 
-		key := fmt.Sprintf("mrc20_utxo_%s", utxo.TxPoint)
-		err = batch.Set([]byte(key), data, pebble.Sync)
-		if err != nil {
-			log.Println("Set mrc20 utxo error:", err)
-		}
-
-		// 收入索引：始终写入 mrc20_in_{ToAddress}
-		// 余额计算只需扫描这个前缀，过滤 Status=0 的记录
-		if utxo.ToAddress != "" {
-			inKey := fmt.Sprintf("mrc20_in_%s_%s_%s", utxo.ToAddress, utxo.Mrc20Id, utxo.TxPoint)
-			err = batch.Set([]byte(inKey), data, pebble.Sync)
+		if utxo.Status == mrc20.UtxoStatusSpent {
+			// Spent UTXO: 从所有索引中删除
+			// 根据新架构设计，Spent UTXO 不保留在 UTXO 表中，历史由 Transaction 流水表记录
+			err := batch.Delete([]byte(mainKey), pebble.Sync)
 			if err != nil {
-				log.Println("Set mrc20 income index error:", err)
+				log.Println("Delete mrc20 utxo error:", err)
 			}
-		}
 
-		// 支出索引：仅当 Status=-1（已消耗）时创建
-		// 此时 ToAddress 是发送者（原 UTXO 持有者），这条记录代表支出
-		if utxo.Status == mrc20.UtxoStatusSpent && utxo.ToAddress != "" {
-			outKey := fmt.Sprintf("mrc20_out_%s_%s_%s", utxo.ToAddress, utxo.Mrc20Id, utxo.TxPoint)
-			err = batch.Set([]byte(outKey), data, pebble.Sync)
+			// 删除 mrc20_in 索引
+			err = batch.Delete([]byte(inKey), pebble.Sync)
 			if err != nil {
-				log.Println("Set mrc20 spend index error:", err)
+				log.Println("Delete mrc20 income index error:", err)
+			}
+
+			// 删除 available_utxo 索引
+			err = batch.Delete([]byte(availableKey), pebble.Sync)
+			if err != nil {
+				log.Println("Delete available utxo index error:", err)
+			}
+
+			log.Printf("[MRC20] Deleted spent UTXO: %s", utxo.TxPoint)
+		} else {
+			// 非 Spent UTXO: 保存/更新记录
+			data, err := sonic.Marshal(utxo)
+			if err != nil {
+				log.Println("Marshal mrc20 utxo error:", err)
+				continue
+			}
+
+			// 保存主记录
+			err = batch.Set([]byte(mainKey), data, pebble.Sync)
+			if err != nil {
+				log.Println("Set mrc20 utxo error:", err)
+			}
+
+			// 保存 mrc20_in 索引
+			if utxo.ToAddress != "" {
+				err = batch.Set([]byte(inKey), data, pebble.Sync)
+				if err != nil {
+					log.Println("Set mrc20 income index error:", err)
+				}
+			}
+
+			// 处理 available_utxo 索引
+			if utxo.Status == mrc20.UtxoStatusAvailable && utxo.ToAddress != "" {
+				// Available UTXO: 写入 available_utxo 索引
+				err = batch.Set([]byte(availableKey), data, pebble.Sync)
+				if err != nil {
+					log.Println("Set available utxo index error:", err)
+				}
+			} else {
+				// Pending UTXO: 从 available_utxo 索引删除
+				err = batch.Delete([]byte(availableKey), pebble.Sync)
+				if err != nil && err != pebble.ErrNotFound {
+					log.Println("Delete available utxo index error:", err)
+				}
 			}
 		}
 	}
@@ -644,31 +686,15 @@ func (pd *PebbleData) GetMrc20AddressHistoryWithDirection(mrc20Id, address strin
 		// 收入记录：收到这笔代币
 		keyIn := utxo.TxPoint + "_in"
 		if !recordMap[keyIn] {
-			recordMap[keyIn] = true
-			allRecords = append(allRecords, &Mrc20HistoryRecord{
-				TxPoint:     utxo.TxPoint,
-				MrcOption:   utxo.MrcOption,
-				Direction:   "in",
-				AmtChange:   utxo.AmtChange.String(),
-				Status:      utxo.Status,
-				Chain:       utxo.Chain,
-				BlockHeight: utxo.BlockHeight,
-				Timestamp:   utxo.Timestamp,
-				FromAddress: utxo.FromAddress,
-				ToAddress:   utxo.ToAddress,
-				OperationTx: txid, // In: 显示创建这笔收入的交易（TxPoint的txid）
-			})
-		}
-
-		// 支出记录：只有当 Status == -1（已消费）时才显示支出
-		if utxo.Status == -1 {
-			keyOut := utxo.TxPoint + "_out"
-			if !recordMap[keyOut] {
-				recordMap[keyOut] = true
+			// 应用 statusFilter：如果指定了 status，只返回匹配的记录
+			if statusFilter != nil && utxo.Status != *statusFilter {
+				// 跳过不匹配的收入记录
+			} else {
+				recordMap[keyIn] = true
 				allRecords = append(allRecords, &Mrc20HistoryRecord{
 					TxPoint:     utxo.TxPoint,
 					MrcOption:   utxo.MrcOption,
-					Direction:   "out",
+					Direction:   "in",
 					AmtChange:   utxo.AmtChange.String(),
 					Status:      utxo.Status,
 					Chain:       utxo.Chain,
@@ -676,8 +702,33 @@ func (pd *PebbleData) GetMrc20AddressHistoryWithDirection(mrc20Id, address strin
 					Timestamp:   utxo.Timestamp,
 					FromAddress: utxo.FromAddress,
 					ToAddress:   utxo.ToAddress,
-					OperationTx: utxo.OperationTx, // Out: 显示消费这笔资产的交易
+					OperationTx: txid, // In: 显示创建这笔收入的交易（TxPoint的txid）
 				})
+			}
+		}
+
+		// 支出记录：只有当 Status == -1（已消费）时才显示支出
+		if utxo.Status == -1 {
+			// 应用 statusFilter：如果指定了 status=-1，才显示支出记录
+			// 如果 statusFilter 为其他值（如 0, 1, 2），不显示支出记录
+			if statusFilter == nil || *statusFilter == -1 {
+				keyOut := utxo.TxPoint + "_out"
+				if !recordMap[keyOut] {
+					recordMap[keyOut] = true
+					allRecords = append(allRecords, &Mrc20HistoryRecord{
+						TxPoint:     utxo.TxPoint,
+						MrcOption:   utxo.MrcOption,
+						Direction:   "out",
+						AmtChange:   utxo.AmtChange.String(),
+						Status:      utxo.Status,
+						Chain:       utxo.Chain,
+						BlockHeight: utxo.BlockHeight,
+						Timestamp:   utxo.Timestamp,
+						FromAddress: utxo.FromAddress,
+						ToAddress:   utxo.ToAddress,
+						OperationTx: utxo.OperationTx, // Out: 显示消费这笔资产的交易
+					})
+				}
 			}
 		}
 	}

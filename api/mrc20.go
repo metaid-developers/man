@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/bytedance/sonic"
+	"github.com/cockroachdb/pebble"
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
 )
@@ -107,12 +109,19 @@ func getHistoryById(ctx *gin.Context) {
 		size = 20
 	}
 	tickId := ctx.Query("tickId")
-	list, err := man.PebbleStore.GetMrc20TransferHistory(tickId, int(cursor), int(size))
+	chain := ctx.Query("chain")
+	if chain == "" {
+		chain = "btc" // 默认 BTC
+	}
+
+	// 新架构：使用 Transaction 流水表
+	// 查询该 tick 的所有交易（不限地址）
+	list, total, err := man.PebbleStore.GetMrc20TransactionHistory("", tickId, chain, int(size), int(cursor))
 	if err != nil || list == nil || len(list) == 0 {
 		ctx.JSON(http.StatusOK, respond.ErrNoDataFound)
 		return
 	}
-	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{"list": list, "total": len(list)}))
+	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{"list": list, "total": total}))
 }
 
 func getBalanceByAddress(ctx *gin.Context) {
@@ -126,52 +135,50 @@ func getBalanceByAddress(ctx *gin.Context) {
 		size = 20
 	}
 
-	// 获取地址所有 UTXO（不分页，获取全部用于聚合）
-	list, err := man.PebbleStore.GetMrc20UtxoList(address, 0, 0)
-	if err != nil || list == nil || len(list) == 0 {
+	chain := ctx.Query("chain")
+	if chain == "" {
+		chain = "btc" // 默认 BTC
+	}
+
+	// 新架构：使用 AccountBalance 表
+	balanceMap := make(map[string]*mrc20.Mrc20Balance)
+	var nameList []string
+
+	// 获取该地址在指定链的所有余额
+	// 使用前缀扫描 mrc20_balance_{chain}_{address}_
+	prefix := []byte(fmt.Sprintf("mrc20_balance_%s_%s_", chain, address))
+	iter, err := man.PebbleStore.Database.MrcDb.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: append(prefix, 0xff),
+	})
+	if err != nil {
 		ctx.JSON(http.StatusOK, respond.ErrNoDataFound)
 		return
 	}
+	defer iter.Close()
 
-	// 聚合每个 tick 的余额
-	balanceMap := make(map[string]*mrc20.Mrc20Balance)
-	var nameList []string
-	for _, utxo := range list {
-		// 跳过已消耗的 UTXO
-		if utxo.Status == mrc20.UtxoStatusSpent {
+	for iter.First(); iter.Valid(); iter.Next() {
+		var accountBalance mrc20.Mrc20AccountBalance
+		if err := sonic.Unmarshal(iter.Value(), &accountBalance); err != nil {
 			continue
 		}
 
-		// 确保 balanceMap 中有该 tick 的记录
-		if _, ok := balanceMap[utxo.Tick]; !ok {
-			balanceMap[utxo.Tick] = &mrc20.Mrc20Balance{
-				Id:    utxo.Mrc20Id,
-				Name:  utxo.Tick,
-				Chain: utxo.Chain,
-			}
-			nameList = append(nameList, utxo.Tick)
+		// 转换为 API 响应格式
+		balance := &mrc20.Mrc20Balance{
+			Id:                accountBalance.TickId,
+			Name:              accountBalance.Tick,
+			Chain:             accountBalance.Chain,
+			Balance:           accountBalance.Balance,
+			PendingOutBalance: accountBalance.PendingOut,
+			PendingInBalance:  accountBalance.PendingIn,
 		}
-		balance := balanceMap[utxo.Tick]
 
-		// 根据 UTXO 状态分类
-		switch utxo.Status {
-		case mrc20.UtxoStatusTeleportPending, mrc20.UtxoStatusTransferPending:
-			// 待转出余额（发送方 mempool 阶段）
-			// - TeleportPending: teleport 跃迁等待中
-			// - TransferPending: 普通/native transfer 等待确认
-			balance.PendingOutBalance = balance.PendingOutBalance.Add(utxo.AmtChange)
-		case mrc20.UtxoStatusAvailable:
-			if utxo.BlockHeight == -1 {
-				// mempool 中的待确认转入余额（接收方）
-				balance.PendingInBalance = balance.PendingInBalance.Add(utxo.AmtChange)
-			} else {
-				// 已确认的可用余额
-				balance.Balance = balance.Balance.Add(utxo.AmtChange)
-			}
-		}
+		balanceMap[accountBalance.Tick] = balance
+		nameList = append(nameList, accountBalance.Tick)
 	}
 
 	// 查询该地址的 teleport pending in（teleport 接收方的待转入余额）
+	// 注意：这部分暂时保留，因为 teleport pending in 可能还未写入 AccountBalance
 	teleportPendingIns, _ := man.PebbleStore.GetTeleportPendingInByAddress(address)
 	for _, pendingIn := range teleportPendingIns {
 		if balance, ok := balanceMap[pendingIn.Tick]; ok {
@@ -256,7 +263,13 @@ func getAddressHistoryByTickAndAddress(ctx *gin.Context) {
 		size = 20
 	}
 
-	list, total, err := man.PebbleStore.GetMrc20AddressHistory(tickId, address, int(cursor), int(size), nil)
+	chain := ctx.Query("chain")
+	if chain == "" {
+		chain = "btc" // 默认 BTC
+	}
+
+	// 新架构：使用 Transaction 流水表
+	list, total, err := man.PebbleStore.GetMrc20TransactionHistory(address, tickId, chain, int(size), int(cursor))
 	if err != nil || list == nil || len(list) == 0 {
 		ctx.JSON(http.StatusOK, respond.ErrNoDataFound)
 		return
@@ -271,8 +284,30 @@ func getAddressBalance(ctx *gin.Context) {
 		ctx.JSON(http.StatusOK, respond.ErrParameterError)
 		return
 	}
-	totalAmt, _ := man.PebbleStore.GetMrc20Balance(address, tickId)
-	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", totalAmt))
+
+	chain := ctx.Query("chain")
+	if chain == "" {
+		chain = "btc" // 默认 BTC
+	}
+
+	// 新架构：使用 AccountBalance 表
+	accountBalance, err := man.PebbleStore.GetMrc20AccountBalance(chain, address, tickId)
+	if err != nil {
+		// 余额不存在，返回 0
+		ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{
+			"balance":    "0",
+			"pendingIn":  "0",
+			"pendingOut": "0",
+		}))
+		return
+	}
+
+	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{
+		"balance":    accountBalance.Balance.String(),
+		"pendingIn":  accountBalance.PendingIn.String(),
+		"pendingOut": accountBalance.PendingOut.String(),
+		"utxoCount":  accountBalance.UtxoCount,
+	}))
 }
 
 // getIndexHeight 获取指定链的 MRC20 索引高度

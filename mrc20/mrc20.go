@@ -292,3 +292,42 @@ type TeleportPendingIn struct {
 	BlockHeight int64           `json:"blockHeight"` // 记录创建时的区块高度 (-1 表示 mempool)
 	Timestamp   int64           `json:"timestamp"`   // 时间戳
 }
+
+// Mrc20Transaction 表示 MRC20 交易流水记录
+type Mrc20Transaction struct {
+	TxId         string          `json:"txId"`         // 交易 ID (主交易，对于 teleport 是 teleport tx)
+	TxPoint      string          `json:"txPoint"`      // 交易输出点 (txid:vout)，唯一标识此条记录
+	TxIndex      int64           `json:"txIndex"`      // 交易序号 (全局递增，用于排序)
+	PinId        string          `json:"pinId"`        // PIN ID
+	TickId       string          `json:"tickId"`       // tick ID
+	Tick         string          `json:"tick"`         // tick 名称
+	TxType       string          `json:"txType"`       // 交易类型: mint/transfer/teleport_out/teleport_in
+	FromAddress  string          `json:"fromAddress"`  // 发送方地址 (mint 时为空)
+	ToAddress    string          `json:"toAddress"`    // 接收方地址
+	Amount       decimal.Decimal `json:"amount"`       // 交易金额
+	Chain        string          `json:"chain"`        // 交易所在链
+	BlockHeight  int64           `json:"blockHeight"`  // 区块高度
+	Timestamp    int64           `json:"timestamp"`    // 时间戳
+	RelatedTxId  string          `json:"relatedTxId"`  // 关联交易 ID (teleport 的 arrival tx)
+	RelatedChain string          `json:"relatedChain"` // 关联链 (teleport 的目标/源链)
+	RelatedPinId string          `json:"relatedPinId"` // 关联 PIN ID (arrival/teleport PIN)
+	SpentUtxos   string          `json:"spentUtxos"`   // 消耗的 UTXO (JSON 数组字符串)
+	CreatedUtxos string          `json:"createdUtxos"` // 创建的 UTXO (JSON 数组字符串)
+	Msg          string          `json:"msg"`          // 验证失败原因
+	Status       int             `json:"status"`       // 验证状态: 1=成功(verify=true), -1=失败(verify=false)
+}
+
+// Mrc20AccountBalance 表示账户余额记录
+type Mrc20AccountBalance struct {
+	Address          string          `json:"address"`          // 地址
+	TickId           string          `json:"tickId"`           // tick ID
+	Tick             string          `json:"tick"`             // tick 名称
+	Balance          decimal.Decimal `json:"balance"`          // 已确认的可用余额
+	PendingOut       decimal.Decimal `json:"pendingOut"`       // 待转出余额 (teleport pending 源链)
+	PendingIn        decimal.Decimal `json:"pendingIn"`        // 待转入余额 (teleport pending 目标链)
+	Chain            string          `json:"chain"`            // 链名称
+	LastUpdateTx     string          `json:"lastUpdateTx"`     // 最后更新的交易 ID
+	LastUpdateHeight int64           `json:"lastUpdateHeight"` // 最后更新的区块高度
+	LastUpdateTime   int64           `json:"lastUpdateTime"`   // 最后更新时间戳
+	UtxoCount        int             `json:"utxoCount"`        // UTXO 数量 (可用状态)
+}

@@ -130,7 +130,7 @@ func (indexer *Indexer) CatchTransfer(idMap map[string]string) (trasferMap map[s
 
 // IsDissolveTransaction 检测是否为溶解交易
 // 溶解条件:
-// 1. 输入有 ≥3 个 546 聪的 PIN-UTXO
+// 1. 输入有 ≥3 个  PIN-UTXO
 // 2. 输出只有 1 个
 // 3. 输入和输出地址相同
 func (indexer *Indexer) IsDissolveTransaction(tx *wire.MsgTx, idMap map[string]string) bool {
