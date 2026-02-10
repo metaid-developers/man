@@ -450,34 +450,34 @@ func (pd *PebbleData) handleMrc20(chainName string, height int64, pinList *[]*pi
 	case "doge":
 		mrc20Height = common.Config.Doge.Mrc20Height
 	default:
-		log.Printf("[MRC20] Unknown chain: %s", chainName)
+		//log.Printf("[MRC20] Unknown chain: %s", chainName)
 		return
 	}
 
-	log.Printf("[MRC20] handleMrc20 called: chain=%s, height=%d, mrc20Height=%d, pinList=%d", chainName, height, mrc20Height, len(*pinList))
+	//log.Printf("[MRC20] handleMrc20 called: chain=%s, height=%d, mrc20Height=%d, pinList=%d", chainName, height, mrc20Height, len(*pinList))
 
 	// 检查是否配置了 MRC20 启动高度
 	// mrc20Height < 0 表示禁用 MRC20，mrc20Height >= 0 表示从该高度开始启用
 	if mrc20Height < 0 {
-		log.Printf("[MRC20] Disabled for chain %s (mrc20Height=%d)", chainName, mrc20Height)
+		//log.Printf("[MRC20] Disabled for chain %s (mrc20Height=%d)", chainName, mrc20Height)
 		return
 	}
 
 	// 检查当前区块是否达到 MRC20 启动高度
 	if height < mrc20Height {
-		log.Printf("[MRC20] Block height %d < mrc20Height %d, skipping", height, mrc20Height)
+		//log.Printf("[MRC20] Block height %d < mrc20Height %d, skipping", height, mrc20Height)
 		return
 	}
 
 	// 【关键】检查 MRC20 进度是否已追上
 	// MRC20 必须严格按顺序处理，不能跳过中间的区块
 	mrc20CurrentHeight := pd.GetMrc20IndexHeight(chainName)
-	log.Printf("[MRC20] mrc20CurrentHeight=%d, height=%d", mrc20CurrentHeight, height)
+	//log.Printf("[MRC20] mrc20CurrentHeight=%d, height=%d", mrc20CurrentHeight, height)
 	if mrc20CurrentHeight > 0 && mrc20CurrentHeight < height-1 {
 		// MRC20 进度落后，需要先补索引，跳过当前区块
 		// 例如：mrc20CurrentHeight=820000, height=850000
 		// 必须先处理 820001-849999，才能处理 850000
-		log.Printf("[MRC20] Progress behind, need catch-up: current=%d, target=%d", mrc20CurrentHeight, height)
+		//log.Printf("[MRC20] Progress behind, need catch-up: current=%d, target=%d", mrc20CurrentHeight, height)
 		return
 	}
 
@@ -485,16 +485,20 @@ func (pd *PebbleData) handleMrc20(chainName string, height int64, pinList *[]*pi
 	var mrc20List []*pin.PinInscription
 	mrc20TransferPinTx := make(map[string]struct{})
 
+	log.Printf("[DEBUG] handleMrc20: height=%d, pinList count=%d", height, len(*pinList))
 	for _, pinNode := range *pinList {
 		if strings.HasPrefix(pinNode.Path, "/ft/mrc20/") {
 			mrc20List = append(mrc20List, pinNode)
+			log.Printf("[DEBUG] handleMrc20: found MRC20 PIN, path=%s, id=%s, genesisTx=%s", pinNode.Path, pinNode.Id, pinNode.GenesisTransaction)
 			if pinNode.Path == "/ft/mrc20/transfer" {
 				mrc20TransferPinTx[pinNode.GenesisTransaction] = struct{}{}
+				log.Printf("[DEBUG] handleMrc20: added Transfer PIN to mrc20TransferPinTx: %s", pinNode.GenesisTransaction)
 			}
 		}
 	}
+	log.Printf("[DEBUG] handleMrc20: mrc20TransferPinTx count=%d", len(mrc20TransferPinTx))
 
-	log.Printf("[MRC20] Found %d MRC20 PINs in block %d", len(mrc20List), height)
+	//log.Printf("[MRC20] Found %d MRC20 PINs in block %d", len(mrc20List), height)
 
 	// 调用 MRC20 处理函数
 	// 注意：即使没有 MRC20 PIN，也需要处理 Native Transfer（通过 txInList）
@@ -503,5 +507,5 @@ func (pd *PebbleData) handleMrc20(chainName string, height int64, pinList *[]*pi
 
 	// 保存 MRC20 索引进度
 	pd.SaveMrc20IndexHeight(chainName, height)
-	log.Printf("[MRC20] Saved progress for %s: height=%d", chainName, height)
+	//log.Printf("[MRC20] Saved progress for %s: height=%d", chainName, height)
 }

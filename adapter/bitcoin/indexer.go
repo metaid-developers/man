@@ -110,8 +110,8 @@ func (indexer *Indexer) CatchTransfer(idMap map[string]string) (trasferMap map[s
 	trasferMap = make(map[string]*pin.PinTransferInfo)
 	block := indexer.Block.(*wire.MsgBlock)
 	for _, tx := range block.Transactions {
-		// 检测是否为溶解交易
-		isDissolve := indexer.IsDissolveTransaction(tx, idMap)
+		// 检测是否为熔化交易
+		isMeltdown := indexer.IsMeltdownTransaction(tx, idMap)
 
 		for _, in := range tx.TxIn {
 			id := fmt.Sprintf("%s:%d", in.PreviousOutPoint.Hash.String(), in.PreviousOutPoint.Index)
@@ -119,7 +119,7 @@ func (indexer *Indexer) CatchTransfer(idMap map[string]string) (trasferMap map[s
 				info, err := indexer.GetOWnerAddress(id, tx)
 				if err == nil && info != nil {
 					info.FromAddress = fromAddress
-					info.IsDissolve = isDissolve
+					info.IsMeltdown = isMeltdown
 					trasferMap[id] = info
 				}
 			}
@@ -128,12 +128,12 @@ func (indexer *Indexer) CatchTransfer(idMap map[string]string) (trasferMap map[s
 	return
 }
 
-// IsDissolveTransaction 检测是否为溶解交易
-// 溶解条件:
+// IsMeltdownTransaction 检测是否为熔化交易
+// 熔化条件:
 // 1. 输入有 ≥3 个  PIN-UTXO
 // 2. 输出只有 1 个
 // 3. 输入和输出地址相同
-func (indexer *Indexer) IsDissolveTransaction(tx *wire.MsgTx, idMap map[string]string) bool {
+func (indexer *Indexer) IsMeltdownTransaction(tx *wire.MsgTx, idMap map[string]string) bool {
 	// 条件2: 输出只有1个
 	if len(tx.TxOut) != 1 {
 		return false
@@ -170,7 +170,7 @@ func (indexer *Indexer) IsDissolveTransaction(tx *wire.MsgTx, idMap map[string]s
 
 	// 条件1: 输入有 ≥3 个 546 聪的 PIN-UTXO
 	// 条件3: 所有 PIN 输入地址都与输出地址相同
-	return pinUtxoCount >= pin.DissolveMinPinCount && allSameAddress
+	return pinUtxoCount >= pin.MeltdownMinPinCount && allSameAddress
 }
 func (indexer *Indexer) CatchNativeMrc20Transfer(blockHeight int64, utxoList []*mrc20.Mrc20Utxo, mrc20TransferPinTx map[string]struct{}) (savelist []*mrc20.Mrc20Utxo) {
 	pointMap := make(map[string][]*mrc20.Mrc20Utxo)
@@ -232,14 +232,39 @@ func (indexer *Indexer) createMrc20NativeTransfer(tx *wire.MsgTx, blockHeight in
 		id := fmt.Sprintf("%s:%d", in.PreviousOutPoint.Hash.String(), in.PreviousOutPoint.Index)
 		if v, ok := pointMap[id]; ok {
 			for _, utxo := range v {
+				// 【修复】跳过 TeleportPending 状态的 UTXO
+				// TeleportPending 的 UTXO 已经被 teleport 处理，不应该被 native transfer 再次处理
+				if utxo.Status == mrc20.UtxoStatusTeleportPending {
+					continue
+				}
+
 				send := *utxo
+
+				// 检测 UTXO 是否已经被 mempool 阶段处理过
+				// 如果状态是 TransferPending，说明 AmtChange 已经是负数了
+				alreadyProcessedByMempool := utxo.Status == mrc20.UtxoStatusTransferPending
+
+				// 获取原始的正数金额（用于创建接收方 UTXO）
+				originalAmt := utxo.AmtChange
+				if alreadyProcessedByMempool {
+					// UTXO 已被 mempool 处理，AmtChange 是负数，需要取绝对值
+					originalAmt = utxo.AmtChange.Abs()
+				}
+
 				// 根据 blockHeight 判断是 mempool 还是出块
 				if blockHeight == -1 {
 					// mempool 阶段：设置为 TransferPending（待转出）
 					send.Status = mrc20.UtxoStatusTransferPending
+					// 转出的 UTXO，AmtChange 应该是负数
+					send.AmtChange = send.AmtChange.Neg()
 				} else {
 					// 出块确认：设置为 Spent（已消耗）
 					send.Status = mrc20.UtxoStatusSpent
+					if alreadyProcessedByMempool {
+						// 已被 mempool 处理过，AmtChange 已经是负数，不需要再取负
+						// 但需要恢复为正数作为 spent 金额（因为 ProcessNativeTransferSuccess 会处理）
+						send.AmtChange = originalAmt
+					}
 				}
 				send.MrcOption = mrc20.OptionNativeTransfer
 				send.OperationTx = tx.TxHash().String()
@@ -248,8 +273,12 @@ func (indexer *Indexer) createMrc20NativeTransfer(tx *wire.MsgTx, blockHeight in
 				key := send.Mrc20Id
 				_, find := keyMap[key]
 				if find {
-					//keyMap[key].AmtChange += send.AmtChange
-					keyMap[key].AmtChange = keyMap[key].AmtChange.Add(send.AmtChange)
+					// 多个输入情况下累加金额
+					if alreadyProcessedByMempool {
+						keyMap[key].AmtChange = keyMap[key].AmtChange.Add(originalAmt)
+					} else {
+						keyMap[key].AmtChange = keyMap[key].AmtChange.Add(send.AmtChange)
+					}
 				} else {
 					recive := *utxo
 					recive.MrcOption = mrc20.OptionNativeTransfer
@@ -261,6 +290,11 @@ func (indexer *Indexer) createMrc20NativeTransfer(tx *wire.MsgTx, blockHeight in
 					recive.Chain = "btc"
 					recive.Msg = "native-transfer"
 					recive.OperationTx = tx.TxHash().String()
+					// 关键：接收方的新 UTXO 应该是 Available 状态（0），而不是继承原始 UTXO 的状态
+					recive.Status = mrc20.UtxoStatusAvailable
+					// 重要：AmtChange 应该是转入的金额，使用原始 UTXO 的金额（正数）
+					// 如果 UTXO 已被 mempool 处理，AmtChange 可能是负数，需要使用 originalAmt
+					recive.AmtChange = originalAmt
 					keyMap[key] = &recive
 				}
 			}

@@ -72,8 +72,8 @@ func TestDogePin(t *testing.T) {
 	common.Chain = "doge"
 	man.InitAdapter(common.Chain, common.Db, common.TestNet, common.Server)
 
-	txString := "6d275750da23ff67d66ede69333f61ebda55e7a8bc05ce0f0698cbf492075298"
-	blockHeight := int64(6051879)
+	txString := "94809d6598eae303898bb2b342fa61b6026a0717e285d7970b5ff5ee4ea1b9a9"
+	blockHeight := int64(6051005)
 
 	// 由于节点没有 txindex，需要从区块中获取交易
 	block, err := man.ChainAdapter["doge"].GetBlock(blockHeight)

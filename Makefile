@@ -10,6 +10,9 @@ linux:
 	GOOS=linux GOARCH=amd64 \
 	CGO_ENABLED=1 \
 	go build
-
+mrc20_migration:
+	GOOS=linux GOARCH=amd64 \
+	CGO_ENABLED=0 \
+	go build -o mrc20_migration ./tools/cmd/mrc20_migration.go
 run_regtest:
 	CGO_ENABLED=1 go run app.go -test=2 -config=./config_regtest.toml

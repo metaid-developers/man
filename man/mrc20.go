@@ -17,21 +17,40 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// Doge 链交易缓存（因为 Doge 节点没有 txindex）
-// 每次处理新区块时会被覆盖，只缓存当前区块的交易
+// Doge 链交易缓存（保留作为备用，节点现在支持 getrawtransaction）
+// 可以作为性能优化：当前区块内的交易从缓存获取更快
 var dogeTxCache = make(map[string]*btcutil.Tx)
 var dogeTxCacheMutex sync.RWMutex
 
 // SetDogeTxCache 设置 Doge 区块交易缓存（由 dogecoin indexer 在 CatchPins 时调用）
+// 注意：节点现在支持 getrawtransaction，缓存主要用于性能优化
 func SetDogeTxCache(txMap map[string]*btcutil.Tx) {
 	dogeTxCacheMutex.Lock()
 	defer dogeTxCacheMutex.Unlock()
 	dogeTxCache = txMap
 }
 
-// GetTransactionWithCache 获取交易，Doge 链优先从缓存获取
+// ClearDogeTxCache 清除 Doge 交易缓存
+func ClearDogeTxCache() {
+	dogeTxCacheMutex.Lock()
+	defer dogeTxCacheMutex.Unlock()
+	dogeTxCache = make(map[string]*btcutil.Tx)
+}
+
+// GetTransactionWithCache 获取交易
+// Doge 链优先从缓存获取（性能优化），缓存没有则从 RPC 获取
+// 注意：Doge 节点现在支持 getrawtransaction，所以即使缓存没有也能获取到
 func GetTransactionWithCache(chainName string, txid string) (*btcutil.Tx, error) {
-	// 只有 Doge 链使用缓存
+	// 测试时使用 mock 函数
+	if MockGetTransactionWithCache != nil {
+		result, err := MockGetTransactionWithCache(chainName, txid)
+		if err != nil {
+			return nil, err
+		}
+		return result.(*btcutil.Tx), nil
+	}
+
+	// 只有 Doge 链使用缓存优化
 	if chainName == "doge" {
 		dogeTxCacheMutex.RLock()
 		if tx, ok := dogeTxCache[txid]; ok {
@@ -39,6 +58,7 @@ func GetTransactionWithCache(chainName string, txid string) (*btcutil.Tx, error)
 			return tx, nil
 		}
 		dogeTxCacheMutex.RUnlock()
+		// 缓存没有，从 RPC 获取（节点现在支持 getrawtransaction）
 	}
 
 	// 从 RPC 获取
@@ -50,7 +70,7 @@ func GetTransactionWithCache(chainName string, txid string) (*btcutil.Tx, error)
 }
 
 func Mrc20Handle(chainName string, height int64, mrc20List []*pin.PinInscription, mrc20TransferPinTx map[string]struct{}, txInList []string, isMempool bool) {
-	log.Printf("[MRC20] Mrc20Handle: chain=%s, height=%d, mrc20List=%d, txInList=%d", chainName, height, len(mrc20List), len(txInList))
+	//log.Printf("[MRC20] Mrc20Handle: chain=%s, height=%d, mrc20List=%d, txInList=%d", chainName, height, len(mrc20List), len(txInList))
 
 	validator := Mrc20Validator{}
 	var mrc20UtxoList []mrc20.Mrc20Utxo
@@ -61,7 +81,7 @@ func Mrc20Handle(chainName string, height int64, mrc20List []*pin.PinInscription
 	var transferHandleList []*pin.PinInscription
 	var arrivalHandleList []*pin.PinInscription
 	for _, pinNode := range mrc20List {
-		log.Printf("[MRC20] Processing PIN: path=%s, id=%s", pinNode.Path, pinNode.Id)
+		//log.Printf("[MRC20] Processing PIN: path=%s, id=%s", pinNode.Path, pinNode.Id)
 		switch pinNode.Path {
 		case "/ft/mrc20/deploy":
 			//deployHandleList = append(deployHandleList, pinNode)
@@ -90,7 +110,8 @@ func Mrc20Handle(chainName string, height int64, mrc20List []*pin.PinInscription
 
 	for _, pinNode := range mintHandleList {
 		mrc20Pin, err := CreateMrc20MintPin(pinNode, &validator, false)
-		if err == nil {
+		// 保存所有记录，包括验证失败的记录
+		if err == nil || mrc20Pin.Mrc20Id != "" {
 			mrc20Pin.Chain = pinNode.ChainName
 			mrc20UtxoList = append(mrc20UtxoList, mrc20Pin)
 		}
@@ -102,10 +123,18 @@ func Mrc20Handle(chainName string, height int64, mrc20List []*pin.PinInscription
 		// 更新余额和流水（新架构）
 		for _, utxo := range mrc20UtxoList {
 			if utxo.MrcOption == mrc20.OptionMint {
-				// Mint 成功：更新余额 + 写入流水
-				err := PebbleStore.ProcessMintSuccess(&utxo)
-				if err != nil {
-					log.Printf("[ERROR] ProcessMintSuccess failed for %s: %v", utxo.TxPoint, err)
+				if utxo.Verify {
+					// Mint 成功：更新余额 + 写入流水
+					err := PebbleStore.ProcessMintSuccess(&utxo)
+					if err != nil {
+						log.Printf("[ERROR] ProcessMintSuccess failed for %s: %v", utxo.TxPoint, err)
+					}
+				} else {
+					// Mint 失败：仅写入失败流水记录
+					err := PebbleStore.ProcessMintFailure(&utxo)
+					if err != nil {
+						log.Printf("[ERROR] ProcessMintFailure failed for %s: %v", utxo.TxPoint, err)
+					}
 				}
 			}
 
@@ -125,7 +154,8 @@ func Mrc20Handle(chainName string, height int64, mrc20List []*pin.PinInscription
 	// 	}
 	// }
 
-	mrc20TrasferList = transferHandle(transferHandleList)
+	// 处理 transfer PIN（传入 isMempool 参数）
+	mrc20TrasferList = transferHandleWithMempool(transferHandleList, isMempool)
 	if len(mrc20TrasferList) > 0 {
 		//PebbleStore.UpdateMrc20Utxo(mrc20TrasferList, false)
 		for _, item := range mrc20TrasferList {
@@ -136,79 +166,166 @@ func Mrc20Handle(chainName string, height int64, mrc20List []*pin.PinInscription
 	}
 	//CatchNativeMrc20Transfer Agin
 	handleNativTransfer(chainName, height, mrc20TransferPinTx, txInList, isMempool)
+
+	// 出块时：修复所有pending状态的转账
+	// 这个函数会遍历所有TransferPending UTXO，检查对应的接收方UTXO是否已确认
+	// 如果已确认，则调用ProcessNativeTransferSuccess更新余额
+	if !isMempool && height > 0 {
+		fixedCount, err := PebbleStore.FixPendingUtxoStatus(chainName)
+		if err != nil {
+			log.Printf("[ERROR] FixPendingUtxoStatus failed: %v", err)
+		} else if fixedCount > 0 {
+			log.Printf("[INFO] FixPendingUtxoStatus: fixed %d pending UTXOs", fixedCount)
+		}
+	}
+
 	//update holders,txCount
 	for id, txNum := range changedTick {
 		go PebbleStore.UpdateMrc20TickHolder(id, txNum)
 	}
 }
 func handleNativTransfer(chainName string, height int64, mrc20TransferPinTx map[string]struct{}, txInList []string, isMempool bool) {
-	log.Printf("[DEBUG] handleNativTransfer: height=%d, txInList count=%d", height, len(txInList))
+	log.Printf("[DEBUG] handleNativTransfer: height=%d, txInList count=%d, isMempool=%v, transferPinTxCount=%d", height, len(txInList), isMempool, len(mrc20TransferPinTx))
+	// 打印所有 Transfer PIN 交易 ID（调试用）
+	for txid := range mrc20TransferPinTx {
+		log.Printf("[DEBUG] handleNativTransfer: mrc20TransferPinTx contains %s", txid)
+	}
 	mrc20transferCheck, err := PebbleStore.GetMrc20UtxoByOutPutList(txInList, isMempool)
 	log.Printf("[DEBUG] handleNativTransfer: GetMrc20UtxoByOutPutList returned %d UTXOs, err=%v", len(mrc20transferCheck), err)
-	if err == nil && len(mrc20transferCheck) > 0 {
+	if err != nil || len(mrc20transferCheck) == 0 {
+		return
+	}
+
+	// 出块时：先清理 mempool 阶段创建的数据，然后重新获取干净的 UTXO 列表
+	if !isMempool && height > 0 {
+		// 检查是否有 mempool 阶段处理过的 UTXO
+		// 注意：只清理 native transfer 的 UTXO，不清理 Transfer PIN 的 UTXO
+		var pendingUtxos []*mrc20.Mrc20Utxo
 		for _, utxo := range mrc20transferCheck {
-			log.Printf("[DEBUG] handleNativTransfer: found UTXO %s, status=%d, amt=%s", utxo.TxPoint, utxo.Status, utxo.AmtChange)
-		}
-		mrc20TrasferList := IndexerAdapter[chainName].CatchNativeMrc20Transfer(height, mrc20transferCheck, mrc20TransferPinTx)
-		log.Printf("[DEBUG] handleNativTransfer: CatchNativeMrc20Transfer returned %d UTXOs", len(mrc20TrasferList))
-		if len(mrc20TrasferList) > 0 {
-			// 分离 spent 和 new UTXOs
-			var spentUtxos []*mrc20.Mrc20Utxo
-			var newUtxos []*mrc20.Mrc20Utxo
-			for _, utxo := range mrc20TrasferList {
-				if utxo.Status == mrc20.UtxoStatusSpent {
-					spentUtxos = append(spentUtxos, utxo)
-				} else if utxo.Status == mrc20.UtxoStatusAvailable {
-					newUtxos = append(newUtxos, utxo)
-				}
-			}
-
-			// 保存新创建的 UTXOs
-			if len(newUtxos) > 0 {
-				newUtxoValues := make([]mrc20.Mrc20Utxo, len(newUtxos))
-				for i, u := range newUtxos {
-					newUtxoValues[i] = *u
-				}
-				PebbleStore.SaveMrc20Pin(newUtxoValues)
-			}
-
-			// 更新余额和写入流水（如果不是 mempool）
-			if !isMempool && len(spentUtxos) > 0 && len(newUtxos) > 0 {
-				// 按交易分组处理
-				txUtxos := make(map[string]struct {
-					spent []*mrc20.Mrc20Utxo
-					new   []*mrc20.Mrc20Utxo
-				})
-				for _, utxo := range spentUtxos {
-					key := utxo.OperationTx
-					entry := txUtxos[key]
-					entry.spent = append(entry.spent, utxo)
-					txUtxos[key] = entry
-				}
-				for _, utxo := range newUtxos {
-					key := utxo.OperationTx
-					entry := txUtxos[key]
-					entry.new = append(entry.new, utxo)
-					txUtxos[key] = entry
-				}
-
-				for txId, entry := range txUtxos {
-					if len(entry.spent) > 0 && len(entry.new) > 0 {
-						// 构造一个简单的 PIN 信息用于调用 ProcessNativeTransferSuccess
-						err := PebbleStore.ProcessNativeTransferSuccess(txId, chainName, height, entry.spent, entry.new)
-						if err != nil {
-							log.Printf("[ERROR] ProcessNativeTransferSuccess failed for tx %s: %v", txId, err)
-						}
+			if utxo.Status == mrc20.UtxoStatusTransferPending {
+				// 检查 operationTx 是否是 Transfer PIN 交易
+				// 如果是 Transfer PIN，则跳过（让 transferHandleWithMempool 处理）
+				if utxo.OperationTx != "" {
+					if _, isTransferPin := mrc20TransferPinTx[utxo.OperationTx]; isTransferPin {
+						log.Printf("[DEBUG] handleNativTransfer: skipping Transfer PIN UTXO %s, operationTx=%s", utxo.TxPoint, utxo.OperationTx)
+						continue
 					}
 				}
-			} else if isMempool {
-				// mempool 阶段只更新 UTXO 状态
-				PebbleStore.UpdateMrc20Utxo(mrc20TrasferList, isMempool)
+				pendingUtxos = append(pendingUtxos, utxo)
+			}
+		}
+
+		if len(pendingUtxos) > 0 {
+			log.Printf("[DEBUG] handleNativTransfer: found %d TransferPending UTXOs, cleaning mempool data first", len(pendingUtxos))
+			// 清理 mempool 数据
+			err := PebbleStore.CleanMempoolNativeTransfer(pendingUtxos)
+			if err != nil {
+				log.Printf("[ERROR] handleNativTransfer: CleanMempoolNativeTransfer failed: %v", err)
+			}
+
+			// 重新获取干净的 UTXO 列表（现在应该都是 Available 状态）
+			mrc20transferCheck, err = PebbleStore.GetMrc20UtxoByOutPutList(txInList, isMempool)
+			if err != nil || len(mrc20transferCheck) == 0 {
+				log.Printf("[WARN] handleNativTransfer: no UTXOs after cleanup")
+				return
+			}
+			log.Printf("[DEBUG] handleNativTransfer: after cleanup, got %d UTXOs", len(mrc20transferCheck))
+			for _, utxo := range mrc20transferCheck {
+				log.Printf("[DEBUG] handleNativTransfer: cleaned UTXO %s, status=%d, amt=%s", utxo.TxPoint, utxo.Status, utxo.AmtChange)
+			}
+		}
+	}
+
+	mrc20TrasferList := IndexerAdapter[chainName].CatchNativeMrc20Transfer(height, mrc20transferCheck, mrc20TransferPinTx)
+	log.Printf("[DEBUG] handleNativTransfer: CatchNativeMrc20Transfer returned %d UTXOs", len(mrc20TrasferList))
+	if len(mrc20TrasferList) == 0 {
+		return
+	}
+
+	// 分离 spent 和 new UTXOs
+	var spentUtxos []*mrc20.Mrc20Utxo
+	var newUtxos []*mrc20.Mrc20Utxo
+	for _, utxo := range mrc20TrasferList {
+		log.Printf("[DEBUG] handleNativTransfer: result UTXO %s, status=%d, amt=%s, toAddr=%s, operationTx=%s", utxo.TxPoint, utxo.Status, utxo.AmtChange, utxo.ToAddress, utxo.OperationTx)
+		if utxo.Status == mrc20.UtxoStatusSpent {
+			spentUtxos = append(spentUtxos, utxo)
+		} else if utxo.Status == mrc20.UtxoStatusAvailable {
+			// 【修复】区块确认时，检查是否已存在 TeleportPending 状态的 UTXO
+			// 如果已存在，跳过创建新 UTXO，保留 TeleportPending 状态
+			if !isMempool {
+				existingUtxo, err := PebbleStore.GetMrc20UtxoByTxPoint(utxo.TxPoint, false)
+				if err == nil && existingUtxo != nil && existingUtxo.Status == mrc20.UtxoStatusTeleportPending {
+					log.Printf("[DEBUG] handleNativTransfer: skipping UTXO %s, already TeleportPending", utxo.TxPoint)
+					continue
+				}
+			}
+			newUtxos = append(newUtxos, utxo)
+		}
+	}
+	log.Printf("[DEBUG] handleNativTransfer: spentUtxos=%d, newUtxos=%d, isMempool=%v", len(spentUtxos), len(newUtxos), isMempool)
+
+	// 保存新创建的 UTXOs
+	if len(newUtxos) > 0 {
+		newUtxoValues := make([]mrc20.Mrc20Utxo, len(newUtxos))
+		for i, u := range newUtxos {
+			newUtxoValues[i] = *u
+		}
+		PebbleStore.SaveMrc20Pin(newUtxoValues)
+	}
+
+	// 按交易分组处理
+	txUtxos := make(map[string]struct {
+		spent []*mrc20.Mrc20Utxo
+		new   []*mrc20.Mrc20Utxo
+	})
+	for _, utxo := range spentUtxos {
+		key := utxo.OperationTx
+		entry := txUtxos[key]
+		entry.spent = append(entry.spent, utxo)
+		txUtxos[key] = entry
+	}
+	for _, utxo := range newUtxos {
+		key := utxo.OperationTx
+		entry := txUtxos[key]
+		entry.new = append(entry.new, utxo)
+		txUtxos[key] = entry
+	}
+
+	if !isMempool {
+		// 出块确认：更新余额、写入/更新流水
+		log.Printf("[DEBUG] handleNativTransfer: processing %d txs for block confirmation", len(txUtxos))
+		for txId, entry := range txUtxos {
+			log.Printf("[DEBUG] handleNativTransfer: tx %s, spent=%d, new=%d", txId, len(entry.spent), len(entry.new))
+			if len(entry.spent) > 0 && len(entry.new) > 0 {
+				// 先尝试更新已有的 mempool 流水记录的 BlockHeight
+				err := PebbleStore.UpdateMrc20TransactionBlockHeight(txId, height)
+				if err != nil {
+					log.Printf("[WARN] UpdateMrc20TransactionBlockHeight failed for tx %s: %v", txId, err)
+				}
+				// 然后处理余额更新和写入新流水（如果 mempool 没有记录则新写入）
+				err = PebbleStore.ProcessNativeTransferSuccess(txId, chainName, height, entry.spent, entry.new)
+				if err != nil {
+					log.Printf("[ERROR] ProcessNativeTransferSuccess failed for tx %s: %v", txId, err)
+				}
+			}
+		}
+	} else {
+		// mempool 阶段：更新 UTXO 状态 + 写入流水（BlockHeight = -1）
+		PebbleStore.UpdateMrc20Utxo(mrc20TrasferList, isMempool)
+		// 写入 mempool 阶段的流水记录
+		for txId, entry := range txUtxos {
+			if len(entry.spent) > 0 && len(entry.new) > 0 {
+				err := PebbleStore.SaveMempoolNativeTransferTransaction(txId, chainName, entry.spent, entry.new)
+				if err != nil {
+					log.Printf("[WARN] SaveMempoolNativeTransferTransaction failed for tx %s: %v", txId, err)
+				}
 			}
 		}
 	}
 }
-func transferHandle(transferHandleList []*pin.PinInscription) (mrc20UtxoList []*mrc20.Mrc20Utxo) {
+
+// transferHandleWithMempool 处理 transfer PIN，支持 mempool 阶段
+func transferHandleWithMempool(transferHandleList []*pin.PinInscription, isMempool bool) (mrc20UtxoList []*mrc20.Mrc20Utxo) {
 	validator := Mrc20Validator{}
 
 	// 分离普通 transfer 和 teleport transfer
@@ -225,8 +342,7 @@ func transferHandle(transferHandleList []*pin.PinInscription) (mrc20UtxoList []*
 		}
 	}
 
-	log.Printf("[DEBUG] transferHandle: total=%d, normal=%d, teleport=%d",
-		len(transferHandleList), len(normalTransferList), len(teleportTransferList))
+	//log.Printf("[DEBUG] transferHandleWithMempool: total=%d, normal=%d, teleport=%d, isMempool=%v",	len(transferHandleList), len(normalTransferList), len(teleportTransferList), isMempool)
 
 	// 第一步：处理所有普通 transfer，创建输出 UTXO
 	// 使用循环重试机制处理依赖关系（同一区块内普通 transfer 之间的依赖）
@@ -241,46 +357,176 @@ func transferHandle(transferHandleList []*pin.PinInscription) (mrc20UtxoList []*
 				continue
 			}
 
-			log.Printf("[DEBUG] Processing normal transfer PIN: %s", pinNode.Id)
+			//log.Printf("[DEBUG] Processing normal transfer PIN: %s, isMempool=%v", pinNode.Id, isMempool)
 
-			transferPinList, _ := CreateMrc20TransferUtxo(pinNode, &validator, false)
+			transferPinList, _ := CreateMrc20TransferUtxo(pinNode, &validator, isMempool)
 			if len(transferPinList) > 0 {
 				mrc20UtxoList = append(mrc20UtxoList, transferPinList...)
-				normalSuccessMap[pinNode.Id] = struct{}{}
 
-				// 分离 spent 和 new UTXOs
-				var spentUtxos []*mrc20.Mrc20Utxo
-				var newUtxos []*mrc20.Mrc20Utxo
+				// 检查是否有验证失败的 UTXO
+				hasFailedTransfer := false
 				for _, utxo := range transferPinList {
-					if utxo.Status == mrc20.UtxoStatusSpent {
-						spentUtxos = append(spentUtxos, utxo)
+					if !utxo.Verify {
+						hasFailedTransfer = true
+						break
+					}
+				}
+
+				if hasFailedTransfer {
+					// 处理失败的转账：仅保存失败记录，不更新余额
+					failedUtxos := make([]*mrc20.Mrc20Utxo, 0)
+					for _, utxo := range transferPinList {
+						if !utxo.Verify {
+							failedUtxos = append(failedUtxos, utxo)
+						}
+					}
+
+					// 保存失败的 UTXO 记录
+					if len(failedUtxos) > 0 {
+						failedUtxoValues := make([]mrc20.Mrc20Utxo, len(failedUtxos))
+						for i, u := range failedUtxos {
+							failedUtxoValues[i] = *u
+						}
+						PebbleStore.SaveMrc20Pin(failedUtxoValues)
+
+						// 为失败的转账创建流水记录
+						err := PebbleStore.ProcessTransferFailure(failedUtxos)
+						if err != nil {
+							log.Printf("[ERROR] ProcessTransferFailure failed for %s: %v", pinNode.Id, err)
+						}
+					}
+				} else {
+					// 处理成功的转账
+					normalSuccessMap[pinNode.Id] = struct{}{}
+
+					// 处理成功的转账
+					normalSuccessMap[pinNode.Id] = struct{}{}
+
+					// 分离 spent 和 new UTXOs
+					var spentUtxos []*mrc20.Mrc20Utxo
+					var newUtxos []*mrc20.Mrc20Utxo
+					for _, utxo := range transferPinList {
+						if utxo.Verify { // 只处理验证成功的 UTXO
+							if utxo.Status == mrc20.UtxoStatusSpent {
+								spentUtxos = append(spentUtxos, utxo)
+							} else {
+								newUtxos = append(newUtxos, utxo)
+							}
+						}
+					}
+
+					// 保存新创建的 UTXOs
+					if len(newUtxos) > 0 {
+						newUtxoValues := make([]mrc20.Mrc20Utxo, len(newUtxos))
+						for i, u := range newUtxos {
+							newUtxoValues[i] = *u
+						}
+						PebbleStore.SaveMrc20Pin(newUtxoValues)
+					}
+
+					if !isMempool {
+						// 出块确认：先更新已有 mempool 流水的 BlockHeight，然后处理余额和流水
+						if len(spentUtxos) > 0 && len(newUtxos) > 0 {
+							// 尝试更新已有的 mempool 流水记录的 BlockHeight
+							err := PebbleStore.UpdateMrc20TransactionBlockHeight(pinNode.GenesisTransaction, pinNode.GenesisHeight)
+							if err != nil {
+								log.Printf("[WARN] UpdateMrc20TransactionBlockHeight failed for %s: %v", pinNode.GenesisTransaction, err)
+							}
+							// 处理余额更新和写入流水
+							err = PebbleStore.ProcessTransferSuccess(pinNode, spentUtxos, newUtxos)
+							if err != nil {
+								log.Printf("[ERROR] ProcessTransferSuccess failed for %s: %v", pinNode.Id, err)
+							}
+						}
 					} else {
-						newUtxos = append(newUtxos, utxo)
+						// mempool 阶段：只写流水（不更新余额），BlockHeight = -1
+						if len(spentUtxos) > 0 && len(newUtxos) > 0 {
+							err := PebbleStore.SaveMempoolTransferTransaction(pinNode, spentUtxos, newUtxos)
+							if err != nil {
+								log.Printf("[WARN] SaveMempoolTransferTransaction failed for %s: %v", pinNode.Id, err)
+							}
+						}
 					}
 				}
+			} else if !isMempool {
+				// 出块阶段但 CreateMrc20TransferUtxo 返回空
+				// 可能是 mempool 阶段已处理，需要更新 UTXO 的 BlockHeight 并更新余额
+				existingUtxos, _ := PebbleStore.CheckOperationtxAll(pinNode.GenesisTransaction, false)
+				if len(existingUtxos) > 0 {
+					log.Printf("[DEBUG] transferHandleWithMempool: mempool已处理, 更新BlockHeight和余额, tx=%s, utxoCount=%d",
+						pinNode.GenesisTransaction, len(existingUtxos))
 
-				// 保存新创建的 UTXOs
-				if len(newUtxos) > 0 {
-					newUtxoValues := make([]mrc20.Mrc20Utxo, len(newUtxos))
-					for i, u := range newUtxos {
-						newUtxoValues[i] = *u
-					}
-					PebbleStore.SaveMrc20Pin(newUtxoValues)
-				}
-
-				// 调用 ProcessTransferSuccess 来处理完整的 transfer 流程
-				// 这会删除 spent UTXOs，更新余额，写入流水
-				if len(spentUtxos) > 0 && len(newUtxos) > 0 {
-					err := PebbleStore.ProcessTransferSuccess(pinNode, spentUtxos, newUtxos)
+					// 更新 BlockHeight 从 -1 到实际区块高度
+					err := PebbleStore.UpdateUtxosBlockHeight(existingUtxos, pinNode.GenesisHeight)
 					if err != nil {
-						log.Printf("[ERROR] ProcessTransferSuccess failed for %s: %v", pinNode.Id, err)
+						log.Printf("[WARN] UpdateUtxosBlockHeight failed for %s: %v", pinNode.GenesisTransaction, err)
+					}
+					// 同时更新 Transaction 记录的 BlockHeight
+					err = PebbleStore.UpdateMrc20TransactionBlockHeight(pinNode.GenesisTransaction, pinNode.GenesisHeight)
+					if err != nil {
+						log.Printf("[WARN] UpdateMrc20TransactionBlockHeight failed for %s: %v", pinNode.GenesisTransaction, err)
+					}
+
+					// 分离 spent 和 new UTXOs，调用 ProcessTransferSuccess 更新余额
+					var spentUtxos []*mrc20.Mrc20Utxo
+					var newUtxos []*mrc20.Mrc20Utxo
+					for _, utxo := range existingUtxos {
+						if utxo.Status == mrc20.UtxoStatusSpent || utxo.Status == mrc20.UtxoStatusTransferPending {
+							// spent 或 pending spent
+							spentUtxos = append(spentUtxos, utxo)
+						} else if utxo.Status == mrc20.UtxoStatusAvailable {
+							// 新创建的 UTXO
+							newUtxos = append(newUtxos, utxo)
+						}
+					}
+
+					log.Printf("[DEBUG] transferHandleWithMempool: spent=%d, new=%d", len(spentUtxos), len(newUtxos))
+
+					// 关键：把 TransferPending 的源 UTXO 更新为 Spent
+					// 这样 FixPendingUtxoStatus 就不会重复处理
+					for _, utxo := range spentUtxos {
+						if utxo.Status == mrc20.UtxoStatusTransferPending {
+							utxo.Status = mrc20.UtxoStatusSpent
+							utxo.BlockHeight = pinNode.GenesisHeight // 更新 BlockHeight
+						}
+					}
+					if len(spentUtxos) > 0 {
+						err := PebbleStore.UpdateMrc20Utxo(spentUtxos, false)
+						if err != nil {
+							log.Printf("[WARN] UpdateMrc20Utxo(spent) failed for %s: %v", pinNode.GenesisTransaction, err)
+						}
+					}
+
+					// 直接从 UTXO 重算涉及地址的余额（和 reindex-from 一样可靠）
+					affectedAddresses := make(map[string]string) // address -> tickId
+					for _, utxo := range existingUtxos {
+						// 接收方地址 (ToAddress)
+						if utxo.ToAddress != "" && utxo.Mrc20Id != "" {
+							affectedAddresses[utxo.ToAddress] = utxo.Mrc20Id
+						}
+						// 发送方地址 (FromAddress) - 关键：从 new UTXO 获取发送方
+						if utxo.FromAddress != "" && utxo.Mrc20Id != "" {
+							affectedAddresses[utxo.FromAddress] = utxo.Mrc20Id
+						}
+					}
+
+					log.Printf("[DEBUG] transferHandleWithMempool: affectedAddresses=%v", affectedAddresses)
+
+					for address, tickId := range affectedAddresses {
+						err := PebbleStore.RecalculateBalance(pinNode.ChainName, address, tickId)
+						if err != nil {
+							log.Printf("[ERROR] RecalculateBalance failed for %s: %v", address, err)
+						} else {
+							log.Printf("[INFO] RecalculateBalance: 余额已重算, address=%s, tickId=%s", address, tickId)
+						}
 					}
 				}
+				normalSuccessMap[pinNode.Id] = struct{}{}
 			}
 		}
 	}
 
-	// 第二步：处理所有 teleport transfer
+	// 第二步：处理所有 teleport transfer（teleport 在 mempool 阶段暂不处理流水）
 	// 此时同一区块内的普通 transfer 已经处理完毕，UTXO 已创建
 	teleportSuccessMap := make(map[string]struct{})
 	maxTimes = len(teleportTransferList)
@@ -293,11 +539,10 @@ func transferHandle(transferHandleList []*pin.PinInscription) (mrc20UtxoList []*
 				continue
 			}
 
-			log.Printf("[DEBUG] Processing teleport transfer PIN: %s", pinNode.Id)
+			//log.Printf("[DEBUG] Processing teleport transfer PIN: %s", pinNode.Id)
 
-			isTeleport, teleportUtxoList, err := processTeleportTransfer(pinNode, false)
-			log.Printf("[DEBUG] processTeleportTransfer result: isTeleport=%v, utxoCount=%d, err=%v",
-				isTeleport, len(teleportUtxoList), err)
+			isTeleport, teleportUtxoList, err := processTeleportTransfer(pinNode, isMempool)
+			//log.Printf("[DEBUG] processTeleportTransfer result: isTeleport=%v, utxoCount=%d, err=%v",	isTeleport, len(teleportUtxoList), err)
 
 			if !isTeleport {
 				// 不应该发生，因为我们已经预先筛选过
@@ -314,7 +559,7 @@ func transferHandle(transferHandleList []*pin.PinInscription) (mrc20UtxoList []*
 
 			if len(teleportUtxoList) > 0 {
 				mrc20UtxoList = append(mrc20UtxoList, teleportUtxoList...)
-				PebbleStore.UpdateMrc20Utxo(teleportUtxoList, false)
+				PebbleStore.UpdateMrc20Utxo(teleportUtxoList, isMempool)
 			}
 			teleportSuccessMap[pinNode.Id] = struct{}{}
 		}
@@ -356,12 +601,12 @@ func IsTeleportTransferDebug(pinNode *pin.PinInscription) bool {
 }
 
 func deployHandle(pinNode *pin.PinInscription) (mrc20UtxoList []mrc20.Mrc20Utxo) {
-	log.Printf("[MRC20] deployHandle: pinId=%s", pinNode.Id)
+	//log.Printf("[MRC20] deployHandle: pinId=%s", pinNode.Id)
 	var deployList []mrc20.Mrc20DeployInfo
 	validator := Mrc20Validator{}
 	//for _, pinNode := range deployHandleList {
 	mrc20Pin, preMineUtxo, info, err := CreateMrc20DeployPin(pinNode, &validator)
-	log.Printf("[MRC20] CreateMrc20DeployPin result: err=%v, mrc20Id=%s, tick=%s", err, info.Mrc20Id, info.Tick)
+	//log.Printf("[MRC20] CreateMrc20DeployPin result: err=%v, mrc20Id=%s, tick=%s", err, info.Mrc20Id, info.Tick)
 	if err == nil {
 		if mrc20Pin.Mrc20Id != "" {
 			mrc20Pin.Chain = pinNode.ChainName
@@ -382,24 +627,24 @@ func deployHandle(pinNode *pin.PinInscription) (mrc20UtxoList []mrc20.Mrc20Utxo)
 }
 func CreateMrc20DeployPin(pinNode *pin.PinInscription, validator *Mrc20Validator) (mrc20Utxo mrc20.Mrc20Utxo, preMineUtxo mrc20.Mrc20Utxo, info mrc20.Mrc20DeployInfo, err error) {
 	var df mrc20.Mrc20Deploy
-	log.Printf("[MRC20] CreateMrc20DeployPin: contentBody=%s", string(pinNode.ContentBody))
+	//log.Printf("[MRC20] CreateMrc20DeployPin: contentBody=%s", string(pinNode.ContentBody))
 	err = json.Unmarshal(pinNode.ContentBody, &df)
 	if err != nil {
-		log.Printf("[MRC20] CreateMrc20DeployPin: json unmarshal error: %v", err)
+		//log.Printf("[MRC20] CreateMrc20DeployPin: json unmarshal error: %v", err)
 		return
 	}
-	log.Printf("[MRC20] CreateMrc20DeployPin: parsed deploy data: tick=%s, mintCount=%s, amtPerMint=%s, premineCount=%s", df.Tick, df.MintCount, df.AmtPerMint, df.PremineCount)
+	//log.Printf("[MRC20] CreateMrc20DeployPin: parsed deploy data: tick=%s, mintCount=%s, amtPerMint=%s, premineCount=%s", df.Tick, df.MintCount, df.AmtPerMint, df.PremineCount)
 	premineCount := int64(0)
 	if df.PremineCount != "" {
 		premineCount, err = strconv.ParseInt(df.PremineCount, 10, 64)
 		if err != nil {
-			log.Printf("[MRC20] CreateMrc20DeployPin: premineCount parse error: %v", err)
+			//log.Printf("[MRC20] CreateMrc20DeployPin: premineCount parse error: %v", err)
 			return
 		}
 	}
 	mintCount, err := strconv.ParseInt(df.MintCount, 10, 64)
 	if err != nil {
-		log.Printf("[MRC20] CreateMrc20DeployPin: mintCount parse error: %v", err)
+		//log.Printf("[MRC20] CreateMrc20DeployPin: mintCount parse error: %v", err)
 		return
 	}
 	if mintCount < 0 {
@@ -407,7 +652,7 @@ func CreateMrc20DeployPin(pinNode *pin.PinInscription, validator *Mrc20Validator
 	}
 	amtPerMint, err := strconv.ParseInt(df.AmtPerMint, 10, 64)
 	if err != nil {
-		log.Printf("[MRC20] CreateMrc20DeployPin: amtPerMint parse error: %v", err)
+		//log.Printf("[MRC20] CreateMrc20DeployPin: amtPerMint parse error: %v", err)
 		return
 	}
 	if amtPerMint < 0 {
@@ -415,12 +660,12 @@ func CreateMrc20DeployPin(pinNode *pin.PinInscription, validator *Mrc20Validator
 	}
 	//premineCount
 	if mintCount < premineCount {
-		log.Printf("[MRC20] CreateMrc20DeployPin: mintCount(%d) < premineCount(%d), returning", mintCount, premineCount)
+		//log.Printf("[MRC20] CreateMrc20DeployPin: mintCount(%d) < premineCount(%d), returning", mintCount, premineCount)
 		return
 	}
-	log.Printf("[MRC20] CreateMrc20DeployPin: calling validator.Deploy")
+	//log.Printf("[MRC20] CreateMrc20DeployPin: calling validator.Deploy")
 	premineAddress, pointValue, err1 := validator.Deploy(pinNode.ContentBody, pinNode)
-	log.Printf("[MRC20] CreateMrc20DeployPin: validator.Deploy result: premineAddress=%s, pointValue=%d, err=%v", premineAddress, pointValue, err1)
+	//log.Printf("[MRC20] CreateMrc20DeployPin: validator.Deploy result: premineAddress=%s, pointValue=%d, err=%v", premineAddress, pointValue, err1)
 	if err1 != nil {
 		//mrc20Utxo.Verify = false
 		//mrc20Utxo.Msg = err1.Error()
@@ -528,7 +773,7 @@ func CreateMrc20MintPin(pinNode *pin.PinInscription, validator *Mrc20Validator, 
 }
 
 func CreateMrc20TransferUtxo(pinNode *pin.PinInscription, validator *Mrc20Validator, isMempool bool) (mrc20UtxoList []*mrc20.Mrc20Utxo, err error) {
-	log.Printf("[DEBUG] CreateMrc20TransferUtxo START: pinId=%s, tx=%s", pinNode.Id, pinNode.GenesisTransaction)
+	log.Printf("[DEBUG] CreateMrc20TransferUtxo START: pinId=%s, tx=%s, isMempool=%v", pinNode.Id, pinNode.GenesisTransaction, isMempool)
 
 	//Check if it has been processed
 	find, err1 := PebbleStore.CheckOperationtx(pinNode.GenesisTransaction, isMempool)
@@ -554,8 +799,7 @@ func CreateMrc20TransferUtxo(pinNode *pin.PinInscription, validator *Mrc20Valida
 		mrc20UtxoList = sendAllAmountToFirstOutput(pinNode, msg, isMempool)
 		return
 	}
-	log.Printf("[DEBUG] CreateMrc20TransferUtxo: validator.Transfer SUCCESS, pinId=%s, toAddressCount=%d, utxoListCount=%d, firstIdx=%d",
-		pinNode.Id, len(toAddress), len(utxoList), firstIdx)
+	log.Printf("[DEBUG] CreateMrc20TransferUtxo: validator.Transfer SUCCESS, pinId=%s, toAddressCount=%d, utxoListCount=%d, firstIdx=%d", pinNode.Id, len(toAddress), len(utxoList), firstIdx)
 	address := make(map[string]string)
 	name := make(map[string]string)
 	inputAmtMap := make(map[string]decimal.Decimal)
@@ -700,7 +944,7 @@ func sendAllAmountToFirstOutput(pinNode *pin.PinInscription, msg string, isMempo
 			utxoList[item.Mrc20Id] = &mrc20.Mrc20Utxo{
 				Mrc20Id:     item.Mrc20Id,
 				Tick:        item.Tick,
-				Verify:      true,
+				Verify:      true, // 资产转移成功（回退到第一个输出）
 				PinId:       pinNode.Id,
 				BlockHeight: pinNode.GenesisHeight,
 				MrcOption:   mrc20.OptionDataTransfer,
@@ -786,6 +1030,17 @@ func arrivalHandle(pinNode *pin.PinInscription) error {
 	// 检查是否已存在相同 assetOutpoint 的 arrival
 	existingArrival, _ := PebbleStore.GetMrc20ArrivalByAssetOutpoint(data.AssetOutpoint)
 	if existingArrival != nil {
+		// 如果已存在 arrival 且当前是区块确认（非 mempool），可能是 mempool→确认 的过渡
+		if pinNode.GenesisHeight > 0 && existingArrival.Status == mrc20.ArrivalStatusPending {
+			// 更新区块高度并重新处理（从 mempool 变为确认）
+			log.Printf("[Arrival] Existing arrival %s transitioning from mempool to block %d", existingArrival.PinId, pinNode.GenesisHeight)
+			existingArrival.BlockHeight = pinNode.GenesisHeight
+			existingArrival.Timestamp = pinNode.Timestamp
+			PebbleStore.SaveMrc20Arrival(existingArrival)
+			// 重新处理 pending teleport（现在会执行完整 teleport）
+			processPendingTeleportForArrival(existingArrival)
+			return nil
+		}
 		return saveInvalidArrival(pinNode, "arrival already exists for this assetOutpoint")
 	}
 
@@ -902,6 +1157,9 @@ func saveTeleportPendingIn(arrival *mrc20.Mrc20Arrival, pending *mrc20.PendingTe
 
 // processPendingTeleportForArrival 处理等待特定 arrival 的 pending teleport
 // 当 arrival 被处理后调用，检查是否有 teleport 在等待这个 arrival
+// 【选项 B】严格等待确认：
+// - mempool 时只保存 TeleportPendingIn（接收方 PendingIn += amount），不执行 teleport
+// - 区块确认时才执行完整的 teleport
 func processPendingTeleportForArrival(arrival *mrc20.Mrc20Arrival) {
 	pending, err := PebbleStore.GetPendingTeleportByCoord(arrival.PinId)
 	if err != nil {
@@ -909,7 +1167,8 @@ func processPendingTeleportForArrival(arrival *mrc20.Mrc20Arrival) {
 		return
 	}
 
-	log.Printf("Found pending teleport %s waiting for arrival %s, processing now...", pending.PinId, arrival.PinId)
+	isMempool := arrival.BlockHeight == -1
+	log.Printf("Found pending teleport %s waiting for arrival %s (isMempool=%v), processing...", pending.PinId, arrival.PinId, isMempool)
 
 	// 验证 pending teleport 的 assetOutpoint 与 arrival 声明的一致
 	if pending.AssetOutpoint != arrival.AssetOutpoint {
@@ -922,8 +1181,23 @@ func processPendingTeleportForArrival(arrival *mrc20.Mrc20Arrival) {
 		return
 	}
 
-	// 保存 TeleportPendingIn 记录（用于接收方的 PendingInBalance）
-	saveTeleportPendingIn(arrival, pending)
+	// 检查是否已经保存过 TeleportPendingIn（mempool 时已保存）
+	existingPendingIn, _ := PebbleStore.GetTeleportPendingInByCoord(arrival.PinId)
+
+	if isMempool {
+		// 【mempool 阶段】只保存 TeleportPendingIn，不执行 teleport
+		if existingPendingIn == nil {
+			saveTeleportPendingIn(arrival, pending)
+			log.Printf("[Teleport Mempool] Saved PendingIn for receiver, waiting for block confirmation")
+		}
+		return
+	}
+
+	// 【区块确认阶段】执行完整的 teleport
+	// 如果 mempool 阶段没有保存 PendingIn，先保存
+	if existingPendingIn == nil {
+		saveTeleportPendingIn(arrival, pending)
+	}
 
 	// 获取 UTXO 并验证状态
 	sourceUtxo, err := PebbleStore.GetMrc20UtxoByTxPoint(pending.AssetOutpoint, false)
@@ -954,13 +1228,23 @@ func processPendingTeleportForArrival(arrival *mrc20.Mrc20Arrival) {
 	}
 
 	// 构造 pinNode 用于处理
+	// 注意：使用 arrival 的区块高度，因为这是 teleport 完成确认的时间
+	// pending.BlockHeight 可能是 -1 (mempool 阶段创建的)
+	teleportBlockHeight := pending.BlockHeight
+	teleportTimestamp := pending.Timestamp
+	if arrival.BlockHeight > 0 {
+		// 如果 arrival 已确认，使用 arrival 的区块高度作为 teleport 完成高度
+		teleportBlockHeight = arrival.BlockHeight
+		teleportTimestamp = arrival.Timestamp
+	}
+
 	fakePinNode := &pin.PinInscription{
 		Id:                 pending.PinId,
 		GenesisTransaction: pending.TxId,
 		Address:            pending.FromAddress,
 		ChainName:          pending.SourceChain,
-		GenesisHeight:      pending.BlockHeight,
-		Timestamp:          pending.Timestamp,
+		GenesisHeight:      teleportBlockHeight,
+		Timestamp:          teleportTimestamp,
 		ContentBody:        pending.RawContent,
 	}
 
@@ -983,7 +1267,7 @@ func processPendingTeleportForArrival(arrival *mrc20.Mrc20Arrival) {
 	pending.Status = 1
 	PebbleStore.SavePendingTeleport(pending)
 
-	log.Printf("Pending teleport %s processed successfully", pending.PinId)
+	log.Printf("Pending teleport %s processed successfully (block confirmed)", pending.PinId)
 }
 
 // saveCompletedArrival 保存已完成的 arrival 记录
@@ -1065,7 +1349,7 @@ func getAddressFromOutputWithHeight(chainName, txid string, outputIndex int, blo
 		return "", fmt.Errorf("get transaction failed and no block height provided: %w", err)
 	}
 
-	log.Printf("[MRC20] GetTransaction failed for %s, trying to get from block %d", txid, blockHeight)
+	//log.Printf("[MRC20] GetTransaction failed for %s, trying to get from block %d", txid, blockHeight)
 
 	block, err := ChainAdapter[chainName].GetBlock(blockHeight)
 	if err != nil {
@@ -1211,8 +1495,17 @@ func validateAndProcessTeleport(pinNode *pin.PinInscription, data mrc20.Mrc20Tel
 	}
 
 	// 2. 检查是否已有对应的 teleport (防止重复处理)
+	// 包括检查 PendingTeleport（mempool 阶段创建的）
 	if PebbleStore.CheckTeleportExists(data.Coord) {
 		return nil, fmt.Errorf("teleport already exists for coord: %s", data.Coord)
+	}
+
+	// 检查是否已有 PendingTeleport（mempool 时创建，区块确认时跳过）
+	existingPending, _ := PebbleStore.GetPendingTeleportByCoord(data.Coord)
+	if existingPending != nil && existingPending.Status == 0 {
+		// mempool 时已经处理过，等待 arrival 确认
+		log.Printf("[Teleport] PendingTeleport already exists for coord %s (from mempool), skipping", data.Coord)
+		return nil, nil // 返回 nil, nil 表示跳过处理，不是错误
 	}
 
 	// 3. 解析 teleport 金额
@@ -1293,21 +1586,24 @@ func validateAndProcessTeleport(pinNode *pin.PinInscription, data mrc20.Mrc20Tel
 		pendingTx := &mrc20.Mrc20Transaction{
 			Chain:        pinNode.ChainName,
 			TxId:         pinNode.GenesisTransaction,
-			TxPoint:      sourceUtxo.TxPoint,
+			TxPoint:      sourceUtxo.TxPoint + "_pending",
 			TxIndex:      0,
 			PinId:        pinNode.Id,
 			TickId:       data.Id,
 			Tick:         sourceUtxo.Tick,
 			TxType:       "teleport_pending",
+			Direction:    "out", // 支出（pending 状态）
+			Address:      pinNode.Address,
 			FromAddress:  pinNode.Address,
-			ToAddress:    "", // pending 状态还没有目标地址
+			ToAddress:    "",
 			Amount:       teleportAmount,
+			IsChange:     false,
 			SpentUtxos:   fmt.Sprintf("[\"%s\"]", sourceUtxo.TxPoint),
 			CreatedUtxos: "[]",
 			BlockHeight:  pinNode.GenesisHeight,
 			Timestamp:    pinNode.Timestamp,
 			Msg:          fmt.Sprintf("teleport pending, waiting for arrival %s", data.Coord),
-			Status:       1, // pending
+			Status:       1,
 			RelatedChain: data.Chain,
 			RelatedTxId:  "",
 			RelatedPinId: data.Coord,
@@ -1341,20 +1637,103 @@ func validateAndProcessTeleport(pinNode *pin.PinInscription, data mrc20.Mrc20Tel
 		return nil, fmt.Errorf("UTXO mismatch: found %s in inputs, but arrival expects %s", sourceUtxo.TxPoint, arrival.AssetOutpoint)
 	}
 
-	// 10. 保存 TeleportPendingIn 记录（用于接收方的 PendingInBalance）
-	// 构造一个临时的 PendingTeleport 用于调用 saveTeleportPendingIn
-	tempPending := &mrc20.PendingTeleport{
-		PinId:       pinNode.Id,
-		TxId:        pinNode.GenesisTransaction,
-		Amount:      data.Amount,
-		FromAddress: pinNode.Address,
-		SourceChain: pinNode.ChainName,
-		BlockHeight: pinNode.GenesisHeight,
-		Timestamp:   pinNode.Timestamp,
-	}
-	saveTeleportPendingIn(arrival, tempPending)
+	// 【选项 B 修复】严格等待确认：mempool 阶段双方都不执行 teleport
+	// - 如果 teleport 或 arrival 任一还在 mempool，先保存 pending 状态
+	// - 只有双方都确认后才执行完整 teleport
+	isTeleportMempool := isMempool || pinNode.GenesisHeight == -1
+	isArrivalMempool := arrival.BlockHeight == -1
 
-	// arrival 已存在且验证通过，执行跃迁
+	if isTeleportMempool || isArrivalMempool {
+		// mempool 阶段：保存 PendingTeleport，将 UTXO 设为 pending
+		log.Printf("[Teleport] Mempool stage: teleportMempool=%v, arrivalMempool=%v, saving pending state",
+			isTeleportMempool, isArrivalMempool)
+
+		// 将 UTXO 状态设为 pending
+		pendingUtxo := *sourceUtxo
+		pendingUtxo.Status = mrc20.UtxoStatusTeleportPending
+		pendingUtxo.Msg = fmt.Sprintf("teleport pending, waiting for confirmation (arrival in mempool: %v)", isArrivalMempool)
+		pendingUtxo.OperationTx = pinNode.GenesisTransaction
+
+		// 保存 pending teleport 记录
+		pending := &mrc20.PendingTeleport{
+			PinId:         pinNode.Id,
+			TxId:          pinNode.GenesisTransaction,
+			Coord:         data.Coord,
+			TickId:        data.Id,
+			Amount:        data.Amount,
+			AssetOutpoint: sourceUtxo.TxPoint,
+			TargetChain:   data.Chain,
+			FromAddress:   pinNode.Address,
+			SourceChain:   pinNode.ChainName,
+			BlockHeight:   pinNode.GenesisHeight,
+			Timestamp:     pinNode.Timestamp,
+			RetryCount:    0,
+			Status:        0, // pending
+			RawContent:    pinNode.ContentBody,
+		}
+		err = PebbleStore.SavePendingTeleport(pending)
+		if err != nil {
+			log.Println("SavePendingTeleport error:", err)
+		}
+
+		// 更新源链 AccountBalance: Balance -= amount, PendingOut += amount, UtxoCount--
+		err = PebbleStore.UpdateMrc20AccountBalance(
+			pinNode.ChainName,
+			pinNode.Address,
+			sourceUtxo.Mrc20Id,
+			sourceUtxo.Tick,
+			teleportAmount.Neg(), // Balance -= amount
+			teleportAmount,       // PendingOut += amount
+			decimal.Zero,         // PendingIn 不变
+			-1,                   // UtxoCount--
+			pinNode.GenesisTransaction,
+			pinNode.GenesisHeight,
+			pinNode.Timestamp,
+		)
+		if err != nil {
+			log.Printf("[ERROR] UpdateMrc20AccountBalance failed for teleport pending: %v", err)
+		}
+
+		// 保存 TeleportPendingIn 记录（接收方的 PendingIn）
+		saveTeleportPendingIn(arrival, pending)
+
+		// 写入 Transaction 流水记录（teleport pending 状态）
+		pendingTx := &mrc20.Mrc20Transaction{
+			Chain:        pinNode.ChainName,
+			TxId:         pinNode.GenesisTransaction,
+			TxPoint:      sourceUtxo.TxPoint + "_pending",
+			TxIndex:      0,
+			PinId:        pinNode.Id,
+			TickId:       data.Id,
+			Tick:         sourceUtxo.Tick,
+			TxType:       "teleport_pending",
+			Direction:    "out",
+			Address:      pinNode.Address,
+			FromAddress:  pinNode.Address,
+			ToAddress:    arrival.ToAddress,
+			Amount:       teleportAmount,
+			IsChange:     false,
+			SpentUtxos:   fmt.Sprintf("[\"%s\"]", sourceUtxo.TxPoint),
+			CreatedUtxos: "[]",
+			BlockHeight:  pinNode.GenesisHeight,
+			Timestamp:    pinNode.Timestamp,
+			Msg:          fmt.Sprintf("teleport pending, waiting for block confirmation"),
+			Status:       1,
+			RelatedChain: data.Chain,
+			RelatedTxId:  arrival.TxId,
+			RelatedPinId: data.Coord,
+		}
+		if err := PebbleStore.SaveMrc20Transaction(pendingTx); err != nil {
+			log.Printf("[ERROR] SaveMrc20Transaction failed for teleport_pending: %v", err)
+		}
+
+		// 返回需要更新的 UTXO（状态变为 pending）
+		return []*mrc20.Mrc20Utxo{&pendingUtxo}, nil
+	}
+
+	// 双方都已确认，执行跃迁
+	log.Printf("[Teleport] Both confirmed: teleport height=%d, arrival height=%d, executing teleport",
+		pinNode.GenesisHeight, arrival.BlockHeight)
 	return executeTeleportTransfer(pinNode, data, sourceUtxo, arrival, isMempool)
 }
 
@@ -1612,25 +1991,28 @@ func executeTeleportTransfer(pinNode *pin.PinInscription, data mrc20.Mrc20Telepo
 		}
 	}
 
-	// 6. 写入源链流水（teleport_out）
+	// 6. 写入源链流水（teleport_out）- 发送方的支出记录
 	sourceTx := &mrc20.Mrc20Transaction{
 		Chain:        pinNode.ChainName,
 		TxId:         pinNode.GenesisTransaction,
-		TxPoint:      spentUtxo.TxPoint, // 使用花费的 UTXO 的 txpoint
-		TxIndex:      0,                 // teleport 只有一笔
+		TxPoint:      spentUtxo.TxPoint + "_out", // 使用花费的 UTXO 的 txpoint + _out 后缀
+		TxIndex:      0,
 		PinId:        pinNode.Id,
 		TickId:       sourceUtxo.Mrc20Id,
 		Tick:         sourceUtxo.Tick,
 		TxType:       "teleport_out",
+		Direction:    "out", // 支出
+		Address:      pinNode.Address,
 		FromAddress:  pinNode.Address,
-		ToAddress:    "", // teleport_out 没有目标地址
+		ToAddress:    arrival.ToAddress,
 		Amount:       teleportAmount,
+		IsChange:     false,
 		SpentUtxos:   fmt.Sprintf("[\"%s\"]", spentUtxo.TxPoint),
 		CreatedUtxos: "[]",
 		BlockHeight:  pinNode.GenesisHeight,
 		Timestamp:    pinNode.Timestamp,
 		Msg:          fmt.Sprintf("teleport to %s", data.Chain),
-		Status:       1, // 完成
+		Status:       1,
 		RelatedChain: data.Chain,
 		RelatedTxId:  arrival.TxId,
 		RelatedPinId: arrival.PinId,
@@ -1640,25 +2022,28 @@ func executeTeleportTransfer(pinNode *pin.PinInscription, data mrc20.Mrc20Telepo
 		log.Printf("[ERROR] SaveMrc20Transaction failed for teleport_out: %v", err)
 	}
 
-	// 6. 写入目标链流水（teleport_in）
+	// 7. 写入目标链流水（teleport_in）- 接收方的收入记录
 	targetTx := &mrc20.Mrc20Transaction{
 		Chain:        arrival.Chain,
 		TxId:         arrival.TxId,
-		TxPoint:      newUtxo.TxPoint, // 使用新创建的 UTXO 的 txpoint
+		TxPoint:      newUtxo.TxPoint,
 		TxIndex:      0,
 		PinId:        arrival.PinId,
 		TickId:       sourceUtxo.Mrc20Id,
 		Tick:         sourceUtxo.Tick,
 		TxType:       "teleport_in",
-		FromAddress:  "", // teleport_in 没有源地址
+		Direction:    "in", // 收入
+		Address:      arrival.ToAddress,
+		FromAddress:  pinNode.Address,
 		ToAddress:    arrival.ToAddress,
 		Amount:       teleportAmount,
+		IsChange:     false,
 		SpentUtxos:   "[]",
 		CreatedUtxos: fmt.Sprintf("[\"%s\"]", newUtxo.TxPoint),
 		BlockHeight:  arrival.BlockHeight,
 		Timestamp:    arrival.Timestamp,
 		Msg:          fmt.Sprintf("teleport from %s", pinNode.ChainName),
-		Status:       1, // 完成
+		Status:       1,
 		RelatedChain: pinNode.ChainName,
 		RelatedTxId:  pinNode.GenesisTransaction,
 		RelatedPinId: pinNode.Id,

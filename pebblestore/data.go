@@ -51,10 +51,10 @@ func (db *Database) UpdateTransferPin(trasferMap map[string]*pin.PinTransferInfo
 			continue
 		}
 
-		// 检查是否为溶解交易
-		if info.IsDissolve {
-			// 溶解交易：只更新状态为溶解，不更新其他信息
-			pinNode.Status = pin.PinStatusDissolved
+		// 检查是否为熔化交易
+		if info.IsMeltdown {
+			// 熔化交易：只更新状态为熔化，不更新其他信息
+			pinNode.Status = pin.PinStatusMeltdown
 		} else {
 			// 普通转移：更新转移信息
 			pinNode.IsTransfered = true

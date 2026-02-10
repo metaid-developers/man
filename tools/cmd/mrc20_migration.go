@@ -379,6 +379,8 @@ func migrateUtxoData(mongoClient *mongo.Client, pebbleDB *pebblestore.Database, 
 			txStatus = 1 // 验证成功
 		}
 
+		// 新架构：每条记录都有 Direction 和 Address 字段
+		// 迁移时只生成收入记录 (支出记录会在实时处理时生成)
 		tx := &mrc20.Mrc20Transaction{
 			Chain:        *chainName,
 			TxId:         txId,
@@ -388,9 +390,12 @@ func migrateUtxoData(mongoClient *mongo.Client, pebbleDB *pebblestore.Database, 
 			TickId:       mrc20Id,
 			Tick:         tick,
 			TxType:       txType,
+			Direction:    "in", // 迁移数据都是收入记录
+			Address:      toAddress,
 			FromAddress:  fromAddress,
 			ToAddress:    toAddress,
 			Amount:       amount,
+			IsChange:     false,
 			SpentUtxos:   "[]",
 			CreatedUtxos: fmt.Sprintf("[\"%s\"]", txPoint),
 			BlockHeight:  blockHeight,
@@ -512,7 +517,8 @@ func migrateUtxoData(mongoClient *mongo.Client, pebbleDB *pebblestore.Database, 
 						log.Printf("Restoring UTXO %s: consumed at height %d (>= endHeight %d), restoring to status=0",
 							utxoData.TxPoint, opHeight, *endHeight)
 						utxoData.Status = 0
-						utxoData.OperationTx = "" // 清除消费交易
+						utxoData.OperationTx = ""  // 清除消费交易
+						utxoData.SpentAtHeight = 0 // 清除消费高度
 					} else {
 						// operationtx 高度 < endHeight，确实已消费，跳过
 						log.Printf("Skipping consumed UTXO %s: consumed at height %d (< endHeight %d)",
@@ -578,6 +584,14 @@ func migrateUtxoData(mongoClient *mongo.Client, pebbleDB *pebblestore.Database, 
 			batch.Set([]byte(availableKey), utxoBytes, pebble.Sync)
 		}
 
+		// 区块创建索引: block_created_{chain}_{height}_{txPoint}
+		// 用于区块级重跑/回滚功能
+		if utxoData.BlockHeight > 0 {
+			blockCreatedKey := fmt.Sprintf("block_created_%s_%d_%s",
+				utxoData.Chain, utxoData.BlockHeight, utxoData.TxPoint)
+			batch.Set([]byte(blockCreatedKey), []byte("1"), pebble.Sync)
+		}
+
 		count++
 		if count%int64(*batchSize) == 0 {
 			if err := batch.Commit(pebble.Sync); err != nil {
@@ -625,6 +639,7 @@ func migrateUtxoData(mongoClient *mongo.Client, pebbleDB *pebblestore.Database, 
 
 	// 新架构：保存 Transaction 历史（尽力而为）
 	// 注意：索引键格式必须与 man/mrc20_new_methods.go 中的 SaveMrc20Transaction 一致
+	// 新设计：每个地址的每个 UTXO 变动一条记录，使用 tx_addr 索引
 	if !*dryRun && len(transactionList) > 0 {
 		log.Printf("\n  Saving %d transaction records (reconstructed from UTXOs)...", len(transactionList))
 		txBatch := pebbleDB.MrcDb.NewBatch()
@@ -632,35 +647,21 @@ func migrateUtxoData(mongoClient *mongo.Client, pebbleDB *pebblestore.Database, 
 		for _, tx := range transactionList {
 			data, _ := sonic.Marshal(tx)
 
-			// 从 CreatedUtxos 中提取 txPoint 作为主键的一部分
-			// CreatedUtxos 格式: ["txid:vout"]
-			txPointForKey := tx.TxId // fallback
-			if tx.CreatedUtxos != "" && tx.CreatedUtxos != "[]" {
-				var utxos []string
-				if err := sonic.UnmarshalString(tx.CreatedUtxos, &utxos); err == nil && len(utxos) > 0 {
-					txPointForKey = utxos[0]
-				}
-			}
+			// 使用 TxPoint 作为主键
+			txPointForKey := tx.TxPoint
 
-			// 主键: tx_{chain}_{txPoint}
-			// txPoint 是全局唯一的，可以直接作为主键
-			key := []byte(fmt.Sprintf("tx_%s_%s", tx.Chain, txPointForKey))
+			// 主键: tx_{txPoint}
+			key := []byte(fmt.Sprintf("tx_%s", txPointForKey))
 			txBatch.Set(key, data, pebble.Sync)
 
-			// 按 tick 查历史索引: tx_tick_{chain}_{tickId}_{blockHeight}_{timestamp}_{txPoint}
-			tickKey := []byte(fmt.Sprintf("tx_tick_%s_%s_%012d_%012d_%s", tx.Chain, tx.TickId, tx.BlockHeight, tx.Timestamp, txPointForKey))
+			// 按 tick 查历史索引: tx_tick_{tickId}_{blockHeight}_{timestamp}_{txPoint}
+			tickKey := []byte(fmt.Sprintf("tx_tick_%s_%012d_%012d_%s", tx.TickId, tx.BlockHeight, tx.Timestamp, txPointForKey))
 			txBatch.Set(tickKey, key, pebble.Sync)
 
-			// From 索引: tx_from_{chain}_{fromAddress}_{tickId}_{blockHeight}_{timestamp}_{txPoint}
-			if tx.FromAddress != "" {
-				fromKey := []byte(fmt.Sprintf("tx_from_%s_%s_%s_%012d_%012d_%s", tx.Chain, tx.FromAddress, tx.TickId, tx.BlockHeight, tx.Timestamp, txPointForKey))
-				txBatch.Set(fromKey, key, pebble.Sync)
-			}
-
-			// To 索引: tx_to_{chain}_{toAddress}_{tickId}_{blockHeight}_{timestamp}_{txPoint}
-			if tx.ToAddress != "" {
-				toKey := []byte(fmt.Sprintf("tx_to_%s_%s_%s_%012d_%012d_%s", tx.Chain, tx.ToAddress, tx.TickId, tx.BlockHeight, tx.Timestamp, txPointForKey))
-				txBatch.Set(toKey, key, pebble.Sync)
+			// 按地址查索引: tx_addr_{address}_{tickId}_{blockHeight}_{timestamp}_{txPoint}
+			if tx.Address != "" {
+				addrKey := []byte(fmt.Sprintf("tx_addr_%s_%s_%012d_%012d_%s", tx.Address, tx.TickId, tx.BlockHeight, tx.Timestamp, txPointForKey))
+				txBatch.Set(addrKey, key, pebble.Sync)
 			}
 
 			txCount++
@@ -1016,6 +1017,9 @@ func convertUtxoData(raw map[string]interface{}) (*mrc20.Mrc20Utxo, error) {
 	}
 	if v, ok := raw["operationtx"].(string); ok {
 		utxo.OperationTx = v
+	}
+	if v, ok := raw["spentatheight"]; ok {
+		utxo.SpentAtHeight = toInt64(v)
 	}
 
 	// Direction 字段已删除，方向由前缀决定：

@@ -221,8 +221,8 @@ func (indexer *Indexer) CatchTransfer(idMap map[string]string) (trasferMap map[s
 	trasferMap = make(map[string]*pin.PinTransferInfo)
 	block := indexer.Block.(*wire.MsgBlock)
 	for _, tx := range block.Transactions {
-		// 检测是否为溶解交易
-		isDissolve := indexer.IsDissolveTransaction(tx, idMap)
+		// 检测是否为熔化交易
+		isMeltdown := indexer.IsMeltdownTransaction(tx, idMap)
 
 		for _, in := range tx.TxIn {
 			id := fmt.Sprintf("%s:%d", in.PreviousOutPoint.Hash.String(), in.PreviousOutPoint.Index)
@@ -230,7 +230,7 @@ func (indexer *Indexer) CatchTransfer(idMap map[string]string) (trasferMap map[s
 				info, err := indexer.GetOWnerAddress(id, tx)
 				if err == nil && info != nil {
 					info.FromAddress = fromAddress
-					info.IsDissolve = isDissolve
+					info.IsMeltdown = isMeltdown
 					trasferMap[id] = info
 				}
 			}
@@ -239,12 +239,12 @@ func (indexer *Indexer) CatchTransfer(idMap map[string]string) (trasferMap map[s
 	return
 }
 
-// IsDissolveTransaction 检测是否为溶解交易
-// 溶解条件:
+// IsMeltdownTransaction 检测是否为熔化交易
+// 熔化条件:
 // 1. 输入有 ≥3 个 546 聪的 PIN-UTXO
 // 2. 输出只有 1 个
 // 3. 输入和输出地址相同
-func (indexer *Indexer) IsDissolveTransaction(tx *wire.MsgTx, idMap map[string]string) bool {
+func (indexer *Indexer) IsMeltdownTransaction(tx *wire.MsgTx, idMap map[string]string) bool {
 	// 条件2: 输出只有1个
 	if len(tx.TxOut) != 1 {
 		return false
@@ -281,14 +281,14 @@ func (indexer *Indexer) IsDissolveTransaction(tx *wire.MsgTx, idMap map[string]s
 
 	// 条件1: 输入有 ≥3 个 546 聪的 PIN-UTXO
 	// 条件3: 所有 PIN 输入地址都与输出地址相同
-	return pinUtxoCount >= pin.DissolveMinPinCount && allSameAddress
+	return pinUtxoCount >= pin.MeltdownMinPinCount && allSameAddress
 }
 func (indexer *Indexer) GetOWnerAddress(inputId string, tx *wire.MsgTx) (info *pin.PinTransferInfo, err error) {
 	//fmt.Println("tx:", tx.TxHash().String(), inputId)
 	info = &pin.PinTransferInfo{}
 	firstInputId := fmt.Sprintf("%s:%d", tx.TxIn[0].PreviousOutPoint.Hash, tx.TxIn[0].PreviousOutPoint.Index)
 	// !!! Accelerate indexing, all assigned to the first
-	if len(tx.TxIn) == 1 || firstInputId == inputId || 1 == 1 {
+	if len(tx.TxIn) == 1 || firstInputId == inputId {
 		class, addresses, _, _ := txscript.ExtractPkScriptAddrs(tx.TxOut[0].PkScript, netParams)
 		if len(addresses) > 0 {
 			info.Address = GetBase58AddressFromPkScript(addresses[0].ScriptAddress(), btcNetParams)
@@ -636,10 +636,19 @@ func (indexer *Indexer) CatchNativeMrc20Transfer(blockHeight int64, utxoList []*
 			id := fmt.Sprintf("%s:%d", in.PreviousOutPoint.Hash.String(), in.PreviousOutPoint.Index)
 			if v, ok := pointMap[id]; ok {
 				for _, utxo := range v {
+					// 【修复】跳过 TeleportPending 状态的 UTXO
+					// TeleportPending 的 UTXO 已经被 teleport 处理，不应该被 native transfer 再次处理
+					if utxo.Status == mrc20.UtxoStatusTeleportPending {
+						continue
+					}
+
 					// 根据 blockHeight 判断是 mempool 还是出块
 					status := mrc20.UtxoStatusSpent
+					amtChange := utxo.AmtChange
 					if blockHeight == -1 {
 						status = mrc20.UtxoStatusTransferPending
+						// 转出的 UTXO，AmtChange 应该是负数
+						amtChange = amtChange.Neg()
 					}
 					send := mrc20.Mrc20Utxo{
 						TxPoint:   id,
@@ -648,6 +657,7 @@ func (indexer *Indexer) CatchNativeMrc20Transfer(blockHeight int64, utxoList []*
 						Verify:    true,
 						Status:    status,
 						MrcOption: mrc20.OptionNativeTransfer,
+						AmtChange: amtChange,
 					}
 					savelist = append(savelist, &send)
 					key := fmt.Sprintf("%s-%s", send.Mrc20Id, send.TxPoint)
@@ -664,6 +674,8 @@ func (indexer *Indexer) CatchNativeMrc20Transfer(blockHeight int64, utxoList []*
 						recive.TxPoint = fmt.Sprintf("%s:%d", tx.TxHash().String(), 0)
 						recive.Chain = "mvc"
 						recive.Timestamp = t
+						// 关键：接收方的新 UTXO 应该是 Available 状态（0）
+						recive.Status = mrc20.UtxoStatusAvailable
 						keyMap[key] = &recive
 					}
 				}

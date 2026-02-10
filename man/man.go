@@ -100,6 +100,15 @@ func InitAdapter(chainType, dbType, test, server string) {
 		//TODO bestHeight写入数据库
 	}
 
+	// 启动时修复所有 pending 状态的 UTXO（确保 mempool 中的状态与链上一致）
+	for _, chain := range chainList {
+		fixed, err := PebbleStore.FixPendingUtxoStatus(chain)
+		if err != nil {
+			log.Printf("[WARN] FixPendingUtxoStatus failed for %s: %v", chain, err)
+		} else if fixed > 0 {
+			log.Printf("[MRC20] FixPendingUtxoStatus: fixed %d pending UTXOs for %s", fixed, chain)
+		}
+	}
 }
 
 // ZmqRun 启动ZMQ监听

@@ -31,13 +31,13 @@
               <thead>
                 <tr>
                   <th scope="col">Height</th>
+                  <th scope="col">Direction</th>
+                  <th scope="col">Amount</th>
                   <th scope="col">TxPoint</th>
                   <th scope="col">Operation</th>
-                  <th scope="col">From</th>
-                  <th scope="col">To</th>
-                  <th scope="col">Amount</th>
-                  <th scope="col">Status</th>
-                  <th scope="col">Msg</th>
+                  <th scope="col">Counterparty</th>
+                  <th scope="col">Chain</th>
+                  <th scope="col">Note</th>
                 </tr>
               </thead>
 
@@ -45,7 +45,27 @@
                 {{ range $v := .List }}
                 <tr>
                   <td>{{ $v.BlockHeight }}</td>
-                  <td style="word-break: break-all; max-width: 180px; font-size: 12px;">
+                  <td>
+                    {{ if eq $v.Direction "in" }}
+                    <span style="background: #10b981; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">
+                      ↓ In{{ if $v.IsChange }} (Change){{ end }}
+                    </span>
+                    {{ else if eq $v.Direction "out" }}
+                    <span style="background: #ef4444; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">↑ Out</span>
+                    {{ else }}
+                    <span style="background: #6b7280; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">--</span>
+                    {{ end }}
+                  </td>
+                  <td style="font-weight: bold;">
+                    {{ if eq $v.Direction "in" }}
+                    <span style="color: #10b981;">+{{ $v.Amount }}</span>
+                    {{ else if eq $v.Direction "out" }}
+                    <span style="color: #ef4444;">-{{ $v.Amount }}</span>
+                    {{ else }}
+                    {{ $v.Amount }}
+                    {{ end }}
+                  </td>
+                  <td style="word-break: break-all; max-width: 150px; font-size: 12px;">
                     <a href="/tx/{{ $v.Chain}}/{{$v.TxId}}" style="color: #3b82f6;">{{ $v.TxPoint | formatAddress }}</a>
                   </td>
                   <td>
@@ -56,9 +76,7 @@
                     {{ else if eq $v.TxType "data-transfer" }}
                     <span style="background: #f59e0b; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">Transfer</span>
                     {{ else if eq $v.TxType "native_transfer" }}
-                    <span style="background: #eab308; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">Native Transfer</span>
-                    {{ else if eq $v.TxType "deploy" }}
-                    <span style="background: #3b82f6; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">Deploy</span>
+                    <span style="background: #eab308; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">Native</span>
                     {{ else if eq $v.TxType "teleport_pending" }}
                     <span style="background: #f97316; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">Teleport Pending</span>
                     {{ else if eq $v.TxType "teleport_out" }}
@@ -69,19 +87,15 @@
                     <span style="background: #6b7280; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">{{ $v.TxType }}</span>
                     {{ end }}
                   </td>
-                  <td style="font-size: 12px;">{{ $v.FromAddress | formatAddress }}</td>
-                  <td style="font-size: 12px;">{{ $v.ToAddress | formatAddress }}</td>
-                  <td>{{ $v.Amount }}</td>
-                  <td>
-                    {{ if eq $v.Status 1 }}
-                    <span style="color: #10b981;">Success</span>
-                    {{ else if eq $v.Status -1 }}
-                    <span style="color: #ef4444;">Failed</span>
+                  <td style="font-size: 12px;">
+                    {{ if eq $v.Direction "in" }}
+                      {{ if $v.FromAddress }}from: {{ $v.FromAddress | formatAddress }}{{ end }}
                     {{ else }}
-                    <span style="color: #6b7280;">Unknown</span>
+                      {{ if $v.ToAddress }}to: {{ $v.ToAddress | formatAddress }}{{ end }}
                     {{ end }}
                   </td>
-                  <td style="font-size: 11px; max-width: 200px;">{{ $v.Msg }}</td>
+                  <td style="font-size: 11px;">{{ $v.Chain }}</td>
+                  <td style="font-size: 11px; max-width: 150px;">{{ $v.Msg }}</td>
                 </tr>
                 {{ end }}
               </tbody>

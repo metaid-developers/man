@@ -54,24 +54,25 @@ const (
 )
 
 type Mrc20Utxo struct {
-	Tick        string          `json:"tick"`
-	Mrc20Id     string          `json:"mrc20Id"`
-	TxPoint     string          `json:"txPoint"`
-	PointValue  uint64          `json:"pointValue"`
-	PinId       string          `json:"pinId"`
-	PinContent  string          `json:"pinContent"`
-	Verify      bool            `json:"verify"`
-	BlockHeight int64           `json:"blockHeight"`
-	MrcOption   string          `json:"mrcOption"` // 操作类型: deploy, mint, pre-mint, transfer, teleport
-	FromAddress string          `json:"fromAddress"`
-	ToAddress   string          `json:"toAddress"`
-	Msg         string          `json:"msg"`
-	AmtChange   decimal.Decimal `json:"amtChange"`
-	Status      int             `json:"status"`
-	Chain       string          `json:"chain"`
-	Index       int             `json:"index"`
-	Timestamp   int64           `json:"timestamp"`
-	OperationTx string          `json:"operationTx"`
+	Tick          string          `json:"tick"`
+	Mrc20Id       string          `json:"mrc20Id"`
+	TxPoint       string          `json:"txPoint"`
+	PointValue    uint64          `json:"pointValue"`
+	PinId         string          `json:"pinId"`
+	PinContent    string          `json:"pinContent"`
+	Verify        bool            `json:"verify"`
+	BlockHeight   int64           `json:"blockHeight"`
+	MrcOption     string          `json:"mrcOption"` // 操作类型: deploy, mint, pre-mint, transfer, teleport
+	FromAddress   string          `json:"fromAddress"`
+	ToAddress     string          `json:"toAddress"`
+	Msg           string          `json:"msg"`
+	AmtChange     decimal.Decimal `json:"amtChange"`
+	Status        int             `json:"status"`
+	Chain         string          `json:"chain"`
+	Index         int             `json:"index"`
+	Timestamp     int64           `json:"timestamp"`
+	OperationTx   string          `json:"operationTx"`
+	SpentAtHeight int64           `json:"spentAtHeight"` // 被消费时的区块高度，0表示未消费
 }
 type Mrc20DeployQual struct {
 	Creator string `json:"creator"`
@@ -293,6 +294,22 @@ type TeleportPendingIn struct {
 	Timestamp   int64           `json:"timestamp"`   // 时间戳
 }
 
+// TransferPendingIn 表示普通 transfer/native_transfer 接收方的待转入余额记录
+// 当转账在 mempool 中时，记录接收方的 pending in 余额
+type TransferPendingIn struct {
+	TxPoint     string          `json:"txPoint"`     // 新 UTXO 的 outpoint (txid:vout)，唯一标识
+	TxId        string          `json:"txId"`        // 交易 ID
+	ToAddress   string          `json:"toAddress"`   // 接收地址
+	TickId      string          `json:"tickId"`      // MRC20 ID
+	Tick        string          `json:"tick"`        // MRC20 名称
+	Amount      decimal.Decimal `json:"amount"`      // 转账金额
+	Chain       string          `json:"chain"`       // 链名称
+	FromAddress string          `json:"fromAddress"` // 发送方地址
+	TxType      string          `json:"txType"`      // 类型: transfer/native_transfer
+	BlockHeight int64           `json:"blockHeight"` // -1 表示 mempool
+	Timestamp   int64           `json:"timestamp"`   // 时间戳
+}
+
 // Mrc20Transaction 表示 MRC20 交易流水记录
 type Mrc20Transaction struct {
 	TxId         string          `json:"txId"`         // 交易 ID (主交易，对于 teleport 是 teleport tx)
@@ -302,9 +319,12 @@ type Mrc20Transaction struct {
 	TickId       string          `json:"tickId"`       // tick ID
 	Tick         string          `json:"tick"`         // tick 名称
 	TxType       string          `json:"txType"`       // 交易类型: mint/transfer/teleport_out/teleport_in
+	Direction    string          `json:"direction"`    // 流水方向: "in" (收入) / "out" (支出)
+	Address      string          `json:"address"`      // 关联地址（从谁的视角记录这条流水）
 	FromAddress  string          `json:"fromAddress"`  // 发送方地址 (mint 时为空)
 	ToAddress    string          `json:"toAddress"`    // 接收方地址
-	Amount       decimal.Decimal `json:"amount"`       // 交易金额
+	Amount       decimal.Decimal `json:"amount"`       // 交易金额 (始终为正数)
+	IsChange     bool            `json:"isChange"`     // 是否是找零
 	Chain        string          `json:"chain"`        // 交易所在链
 	BlockHeight  int64           `json:"blockHeight"`  // 区块高度
 	Timestamp    int64           `json:"timestamp"`    // 时间戳

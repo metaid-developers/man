@@ -558,9 +558,8 @@ func mrc20History(ctx *gin.Context) {
 		return
 	}
 
-	// 新架构：使用 Transaction 流水表查询全局历史
-	chain := ctx.DefaultQuery("chain", "btc")
-	list, _, err := man.PebbleStore.GetMrc20TransactionHistory("", tickId, chain, pageSize, int((page-1)*int64(pageSize)))
+	// 新架构：使用 Transaction 流水表查询全局历史（跨链统一查询）
+	list, _, err := man.PebbleStore.GetMrc20TransactionHistory("", tickId, pageSize, int((page-1)*int64(pageSize)))
 	if err != nil {
 		ctx.String(200, "fail: "+err.Error())
 		return
@@ -595,9 +594,8 @@ func mrc20AddressHistory(ctx *gin.Context) {
 	// 获取 tick 信息
 	tick, _ := man.PebbleStore.GetMrc20TickInfo(tickId, "")
 
-	// 使用 Transaction 流水表查询（每个 UTXO 一条流水记录）
-	chain := ctx.DefaultQuery("chain", "btc")
-	list, _, err := man.PebbleStore.GetMrc20TransactionHistory(address, tickId, chain, pageSize, int((page-1)*int64(pageSize)))
+	// 使用 Transaction 流水表查询（跨链统一查询，每个 UTXO 一条流水记录）
+	list, _, err := man.PebbleStore.GetMrc20TransactionHistory(address, tickId, pageSize, int((page-1)*int64(pageSize)))
 	if err != nil {
 		ctx.String(200, "fail: "+err.Error())
 		return

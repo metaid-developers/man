@@ -13,6 +13,13 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// 测试用 mock 函数，用于替代真实的链上验证
+// 正常运行时为 nil，测试时可设置为 mock 函数
+var (
+	// MockGetTransactionWithCache 用于测试时 mock GetTransactionWithCache 函数
+	MockGetTransactionWithCache func(chainName string, txid string) (interface{}, error)
+)
+
 // SaveMrc20Pin 保存 MRC20 PIN 数据
 // 根据新架构设计：
 // - UTXO 表只保留 status=0 (Available) 和 status=1/2 (Pending) 的记录
@@ -32,6 +39,40 @@ func (pd *PebbleData) SaveMrc20Pin(utxoList []mrc20.Mrc20Utxo) error {
 			continue
 		}
 
+		// 检查是否已存在该 UTXO
+		// 如果已存在且是 TeleportPending 状态，则跳过（保护跃迁状态不被覆盖）
+		key := fmt.Sprintf("mrc20_utxo_%s", utxo.TxPoint)
+		existingData, closer, err := pd.Database.MrcDb.Get([]byte(key))
+		if err == nil && existingData != nil {
+			var existingUtxo mrc20.Mrc20Utxo
+			if unmarshalErr := sonic.Unmarshal(existingData, &existingUtxo); unmarshalErr == nil {
+				if existingUtxo.Status == mrc20.UtxoStatusTeleportPending {
+					// 已有 UTXO 是 TeleportPending 状态，不能覆盖
+					// 只允许更新 BlockHeight（从 mempool -1 到实际区块高度）
+					closer.Close()
+					if utxo.BlockHeight > existingUtxo.BlockHeight {
+						log.Printf("[INFO] SaveMrc20Pin: UTXO %s is TeleportPending, only updating BlockHeight from %d to %d",
+							utxo.TxPoint, existingUtxo.BlockHeight, utxo.BlockHeight)
+						existingUtxo.BlockHeight = utxo.BlockHeight
+						data, _ := sonic.Marshal(existingUtxo)
+						batch.Set([]byte(key), data, pebble.Sync)
+						// 同时更新索引
+						if existingUtxo.ToAddress != "" {
+							inKey := fmt.Sprintf("mrc20_in_%s_%s_%s", existingUtxo.ToAddress, existingUtxo.Mrc20Id, existingUtxo.TxPoint)
+							batch.Set([]byte(inKey), data, pebble.Sync)
+						}
+					} else {
+						log.Printf("[INFO] SaveMrc20Pin: skipping UTXO %s, already TeleportPending with BlockHeight=%d",
+							utxo.TxPoint, existingUtxo.BlockHeight)
+					}
+					continue
+				}
+			}
+			closer.Close()
+		} else if err != nil && err != pebble.ErrNotFound {
+			log.Printf("[WARN] SaveMrc20Pin: error checking existing UTXO %s: %v", utxo.TxPoint, err)
+		}
+
 		// 保存 UTXO 数据
 		// Key: mrc20_utxo_{txPoint}
 		data, err := sonic.Marshal(utxo)
@@ -40,7 +81,6 @@ func (pd *PebbleData) SaveMrc20Pin(utxoList []mrc20.Mrc20Utxo) error {
 			continue
 		}
 
-		key := fmt.Sprintf("mrc20_utxo_%s", utxo.TxPoint)
 		err = batch.Set([]byte(key), data, pebble.Sync)
 		if err != nil {
 			log.Println("Set mrc20 utxo error:", err)
@@ -56,6 +96,24 @@ func (pd *PebbleData) SaveMrc20Pin(utxoList []mrc20.Mrc20Utxo) error {
 			}
 		}
 
+		// 发送方索引：当 FromAddress 存在时，为发送方创建索引
+		// - 如果 FromAddress != ToAddress：总是创建（这是标准转账）
+		// - 如果 FromAddress == ToAddress 且 Status 是 Pending：也要创建（这是自转账的待转出状态）
+		// 这用于查找该地址待转出的 UTXO，特别是 Status=1,2（Pending）的转账
+		if utxo.FromAddress != "" {
+			// 标准转账或自转账的 Pending 状态，都需要为发送方创建索引
+			shouldCreateOutIndex := (utxo.FromAddress != utxo.ToAddress) ||
+				(utxo.FromAddress == utxo.ToAddress && (utxo.Status == mrc20.UtxoStatusTeleportPending || utxo.Status == mrc20.UtxoStatusTransferPending))
+
+			if shouldCreateOutIndex {
+				outKey := fmt.Sprintf("mrc20_in_%s_%s_%s", utxo.FromAddress, utxo.Mrc20Id, utxo.TxPoint)
+				err = batch.Set([]byte(outKey), data, pebble.Sync)
+				if err != nil {
+					log.Println("Set mrc20 output index error:", err)
+				}
+			}
+		}
+
 		// 可用 UTXO 专用索引：只有 status=0 的 UTXO 写入此索引
 		// 用于快速查询某地址某 tick 的可用 UTXO
 		if utxo.Status == mrc20.UtxoStatusAvailable && utxo.ToAddress != "" {
@@ -63,6 +121,16 @@ func (pd *PebbleData) SaveMrc20Pin(utxoList []mrc20.Mrc20Utxo) error {
 			err = batch.Set([]byte(availableKey), data, pebble.Sync)
 			if err != nil {
 				log.Println("Set available utxo index error:", err)
+			}
+		}
+
+		// 区块创建索引：记录该区块创建了哪些 UTXO（用于回滚/重跑）
+		// 只在出块后（BlockHeight > 0）时记录，mempool 阶段（BlockHeight = -1）不记录
+		if utxo.BlockHeight > 0 && utxo.Chain != "" {
+			blockCreatedKey := fmt.Sprintf("block_created_%s_%d_%s", utxo.Chain, utxo.BlockHeight, utxo.TxPoint)
+			err = batch.Set([]byte(blockCreatedKey), []byte("1"), pebble.Sync)
+			if err != nil {
+				log.Println("Set block_created index error:", err)
 			}
 		}
 	}
@@ -215,6 +283,100 @@ func (pd *PebbleData) UpdateMrc20TickHolder(mrc20Id string, txNum int64) error {
 	return pd.Database.MrcDb.Set([]byte(key), data, pebble.Sync)
 }
 
+// CleanMempoolNativeTransfer 清理 mempool 阶段创建的 native transfer 数据
+// 在出块时调用，用于清理 mempool 阶段的中间状态，让出块流程可以从头处理
+// 1. 恢复 TransferPending 状态的 UTXO 为 Available
+// 2. 删除 mempool 阶段创建的接收方 UTXO (BlockHeight=-1)
+func (pd *PebbleData) CleanMempoolNativeTransfer(pendingUtxos []*mrc20.Mrc20Utxo) error {
+	batch := pd.Database.MrcDb.NewBatch()
+	defer batch.Close()
+
+	for _, utxo := range pendingUtxos {
+		if utxo.Status != mrc20.UtxoStatusTransferPending {
+			continue
+		}
+
+		log.Printf("[DEBUG] CleanMempoolNativeTransfer: cleaning UTXO %s, operationTx=%s", utxo.TxPoint, utxo.OperationTx)
+
+		// 1. 恢复发送方 UTXO 为 Available 状态
+		// AmtChange 如果是负数需要取绝对值
+		originalAmt := utxo.AmtChange
+		if originalAmt.LessThan(decimal.Zero) {
+			originalAmt = originalAmt.Neg()
+		}
+
+		restoredUtxo := *utxo
+		restoredUtxo.Status = mrc20.UtxoStatusAvailable
+		restoredUtxo.AmtChange = originalAmt
+		restoredUtxo.OperationTx = "" // 清除操作交易
+
+		data, err := sonic.Marshal(restoredUtxo)
+		if err != nil {
+			log.Printf("[ERROR] CleanMempoolNativeTransfer: marshal error: %v", err)
+			continue
+		}
+
+		// 保存恢复后的 UTXO
+		mainKey := fmt.Sprintf("mrc20_utxo_%s", utxo.TxPoint)
+		inKey := fmt.Sprintf("mrc20_in_%s_%s_%s", utxo.ToAddress, utxo.Mrc20Id, utxo.TxPoint)
+		availableKey := fmt.Sprintf("available_utxo_%s_%s_%s_%s", utxo.Chain, utxo.ToAddress, utxo.Mrc20Id, utxo.TxPoint)
+
+		batch.Set([]byte(mainKey), data, pebble.Sync)
+		batch.Set([]byte(inKey), data, pebble.Sync)
+		batch.Set([]byte(availableKey), data, pebble.Sync)
+
+		log.Printf("[DEBUG] CleanMempoolNativeTransfer: restored UTXO %s to Available, amt=%s", utxo.TxPoint, originalAmt)
+
+		// 2. 删除 mempool 阶段创建的接收方 UTXO
+		// 接收方 UTXO 的 TxPoint 格式是 {operationTx}:0, {operationTx}:1, ...
+		if utxo.OperationTx != "" {
+			// 检查所有可能的输出（拆分可能有多个输出）
+			for outputIndex := 0; outputIndex < 10; outputIndex++ {
+				receiverTxPoint := fmt.Sprintf("%s:%d", utxo.OperationTx, outputIndex)
+				receiverMainKey := fmt.Sprintf("mrc20_utxo_%s", receiverTxPoint)
+
+				// 先检查接收方 UTXO 是否存在且是 mempool 创建的
+				value, closer, err := pd.Database.MrcDb.Get([]byte(receiverMainKey))
+				if err != nil {
+					// 不存在则停止检查更多输出
+					if outputIndex > 0 {
+						break
+					}
+					continue
+				}
+
+				var receiverUtxo mrc20.Mrc20Utxo
+				if err := sonic.Unmarshal(value, &receiverUtxo); err != nil {
+					closer.Close()
+					continue
+				}
+				closer.Close()
+
+				// 【修复】跳过 TeleportPending 状态的 UTXO
+				// 这些 UTXO 已经被 teleport 处理，不应该被清理
+				if receiverUtxo.Status == mrc20.UtxoStatusTeleportPending {
+					log.Printf("[DEBUG] CleanMempoolNativeTransfer: skipping TeleportPending UTXO %s", receiverTxPoint)
+					continue
+				}
+
+				// 只删除 mempool 创建的 (BlockHeight=-1) 且状态是 Available 的
+				if receiverUtxo.BlockHeight == -1 && receiverUtxo.Status == mrc20.UtxoStatusAvailable {
+					receiverInKey := fmt.Sprintf("mrc20_in_%s_%s_%s", receiverUtxo.ToAddress, receiverUtxo.Mrc20Id, receiverTxPoint)
+					receiverAvailableKey := fmt.Sprintf("available_utxo_%s_%s_%s_%s", receiverUtxo.Chain, receiverUtxo.ToAddress, receiverUtxo.Mrc20Id, receiverTxPoint)
+
+					batch.Delete([]byte(receiverMainKey), pebble.Sync)
+					batch.Delete([]byte(receiverInKey), pebble.Sync)
+					batch.Delete([]byte(receiverAvailableKey), pebble.Sync)
+
+					log.Printf("[DEBUG] CleanMempoolNativeTransfer: deleted mempool receiver UTXO %s, toAddr=%s", receiverTxPoint, receiverUtxo.ToAddress)
+				}
+			}
+		}
+	}
+
+	return batch.Commit(pebble.Sync)
+}
+
 // GetMrc20UtxoByOutPutList 根据输出列表获取 MRC20 UTXO
 // 返回可用状态(0)和等待跃迁状态(1)的 UTXO
 // pending 状态的 UTXO 可以被 native transfer 或普通 transfer 花费
@@ -287,7 +449,7 @@ func (pd *PebbleData) UpdateMrc20Utxo(utxoList []*mrc20.Mrc20Utxo, isMempool boo
 				log.Println("Delete available utxo index error:", err)
 			}
 
-			log.Printf("[MRC20] Deleted spent UTXO: %s", utxo.TxPoint)
+			//log.Printf("[MRC20] Deleted spent UTXO: %s", utxo.TxPoint)
 		} else {
 			// 非 Spent UTXO: 保存/更新记录
 			data, err := sonic.Marshal(utxo)
@@ -389,9 +551,56 @@ func (pd *PebbleData) GetMrc20Shovel(pinIds []string, mrc20Id string) (map[strin
 
 // CheckOperationtx 检查交易是否已处理
 func (pd *PebbleData) CheckOperationtx(txId string, isMempool bool) (*mrc20.Mrc20Utxo, error) {
-	// 查找这个交易ID相关的所有UTXO
-	// Key: mrc20_op_tx_{txId}
+	// 方法1：尝试查找 mrc20_op_tx_ 索引（向后兼容）
 	key := fmt.Sprintf("mrc20_op_tx_%s", txId)
+	value, closer, err := pd.Database.MrcDb.Get([]byte(key))
+	if err == nil {
+		defer closer.Close()
+		var utxo mrc20.Mrc20Utxo
+		err = sonic.Unmarshal(value, &utxo)
+		if err == nil {
+			return &utxo, nil
+		}
+	}
+
+	// 方法2：如果索引不存在，通过扫描 TxPoint 查找
+	// 扫描所有 mrc20_utxo_ 前缀的记录，查找匹配的 txId
+	prefix := []byte("mrc20_utxo_")
+	iter, err := pd.Database.MrcDb.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: append(prefix, 0xff),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		var utxo mrc20.Mrc20Utxo
+		err = sonic.Unmarshal(iter.Value(), &utxo)
+		if err != nil {
+			continue
+		}
+
+		// 检查 TxPoint 是否包含目标 txId
+		// TxPoint 格式: txid:vout 或 txid:vout_out
+		if strings.HasPrefix(utxo.TxPoint, txId+":") {
+			return &utxo, nil
+		}
+
+		// 也检查 OperationTx 字段
+		if utxo.OperationTx == txId {
+			return &utxo, nil
+		}
+	}
+
+	return nil, nil
+}
+
+// CheckOperationtxByTxPoint 通过 TxPoint 查找特定的 UTXO
+func (pd *PebbleData) CheckOperationtxByTxPoint(txPoint string, isMempool bool) (*mrc20.Mrc20Utxo, error) {
+	// 直接通过 TxPoint 查找
+	key := fmt.Sprintf("mrc20_utxo_%s", txPoint)
 	value, closer, err := pd.Database.MrcDb.Get([]byte(key))
 	if err != nil {
 		if err == pebble.ErrNotFound {
@@ -408,6 +617,40 @@ func (pd *PebbleData) CheckOperationtx(txId string, isMempool bool) (*mrc20.Mrc2
 	}
 
 	return &utxo, nil
+}
+
+// CheckOperationtxAll 通过交易 ID 查找该交易的所有 UTXO
+func (pd *PebbleData) CheckOperationtxAll(txId string, isMempool bool) ([]*mrc20.Mrc20Utxo, error) {
+	var result []*mrc20.Mrc20Utxo
+
+	// 扫描所有 mrc20_utxo_ 前缀的记录，查找匹配的 txId
+	prefix := []byte("mrc20_utxo_")
+	iter, err := pd.Database.MrcDb.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: append(prefix, 0xff),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		var utxo mrc20.Mrc20Utxo
+		err = sonic.Unmarshal(iter.Value(), &utxo)
+		if err != nil {
+			continue
+		}
+
+		// 检查 TxPoint 是否包含目标 txId
+		// TxPoint 格式: txid:vout 或 txid:vout_out
+		if strings.HasPrefix(utxo.TxPoint, txId+":") {
+			result = append(result, &utxo)
+		} else if utxo.OperationTx == txId {
+			result = append(result, &utxo)
+		}
+	}
+
+	return result, nil
 }
 
 // GetMrc20ByAddressAndTick 根据地址和代币ID获取余额
@@ -607,14 +850,16 @@ type Mrc20HistoryRecord struct {
 	FromAddress string `json:"fromAddress"`
 	ToAddress   string `json:"toAddress"`
 	OperationTx string `json:"operationTx"`
+	Verify      bool   `json:"verify"`
 }
 
 // GetMrc20AddressHistory 获取某地址在某 tick 的收支流水历史
 // 收入：ToAddress == 该地址（收到代币）
 // 支出：FromAddress == 该地址（转出代币给别人）
 // statusFilter: nil 表示返回所有状态，非 nil 表示只返回指定状态的记录
-func (pd *PebbleData) GetMrc20AddressHistory(mrc20Id, address string, start, limit int, statusFilter *int) ([]*mrc20.Mrc20Utxo, int, error) {
-	records, total, err := pd.GetMrc20AddressHistoryWithDirection(mrc20Id, address, start, limit, statusFilter)
+// verifyFilter: nil 表示返回所有验证状态，非 nil 表示只返回指定验证状态的记录
+func (pd *PebbleData) GetMrc20AddressHistory(mrc20Id, address string, start, limit int, statusFilter *int, verifyFilter *bool) ([]*mrc20.Mrc20Utxo, int, error) {
+	records, total, err := pd.GetMrc20AddressHistoryWithDirection(mrc20Id, address, start, limit, statusFilter, verifyFilter)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -633,6 +878,7 @@ func (pd *PebbleData) GetMrc20AddressHistory(mrc20Id, address string, start, lim
 			FromAddress: r.FromAddress,
 			ToAddress:   r.ToAddress,
 			Mrc20Id:     mrc20Id,
+			Verify:      r.Verify,
 		}
 		// Direction 通过 Status 传递：out 方向设为 -1
 		if r.Direction == "out" {
@@ -645,7 +891,7 @@ func (pd *PebbleData) GetMrc20AddressHistory(mrc20Id, address string, start, lim
 }
 
 // GetMrc20AddressHistoryWithDirection 获取带方向信息的收支流水历史
-func (pd *PebbleData) GetMrc20AddressHistoryWithDirection(mrc20Id, address string, start, limit int, statusFilter *int) ([]*Mrc20HistoryRecord, int, error) {
+func (pd *PebbleData) GetMrc20AddressHistoryWithDirection(mrc20Id, address string, start, limit int, statusFilter *int, verifyFilter *bool) ([]*Mrc20HistoryRecord, int, error) {
 	var allRecords []*Mrc20HistoryRecord
 	recordMap := make(map[string]bool) // 用于去重：key = txPoint + direction
 
@@ -689,6 +935,8 @@ func (pd *PebbleData) GetMrc20AddressHistoryWithDirection(mrc20Id, address strin
 			// 应用 statusFilter：如果指定了 status，只返回匹配的记录
 			if statusFilter != nil && utxo.Status != *statusFilter {
 				// 跳过不匹配的收入记录
+			} else if verifyFilter != nil && utxo.Verify != *verifyFilter {
+				// 跳过不匹配的验证状态记录
 			} else {
 				recordMap[keyIn] = true
 				allRecords = append(allRecords, &Mrc20HistoryRecord{
@@ -703,6 +951,7 @@ func (pd *PebbleData) GetMrc20AddressHistoryWithDirection(mrc20Id, address strin
 					FromAddress: utxo.FromAddress,
 					ToAddress:   utxo.ToAddress,
 					OperationTx: txid, // In: 显示创建这笔收入的交易（TxPoint的txid）
+					Verify:      utxo.Verify,
 				})
 			}
 		}
@@ -711,7 +960,7 @@ func (pd *PebbleData) GetMrc20AddressHistoryWithDirection(mrc20Id, address strin
 		if utxo.Status == -1 {
 			// 应用 statusFilter：如果指定了 status=-1，才显示支出记录
 			// 如果 statusFilter 为其他值（如 0, 1, 2），不显示支出记录
-			if statusFilter == nil || *statusFilter == -1 {
+			if (statusFilter == nil || *statusFilter == -1) && (verifyFilter == nil || utxo.Verify == *verifyFilter) {
 				keyOut := utxo.TxPoint + "_out"
 				if !recordMap[keyOut] {
 					recordMap[keyOut] = true
@@ -727,6 +976,7 @@ func (pd *PebbleData) GetMrc20AddressHistoryWithDirection(mrc20Id, address strin
 						FromAddress: utxo.FromAddress,
 						ToAddress:   utxo.ToAddress,
 						OperationTx: utxo.OperationTx, // Out: 显示消费这笔资产的交易
+						Verify:      utxo.Verify,
 					})
 				}
 			}
@@ -779,7 +1029,7 @@ func (pd *PebbleData) GetMrc20Holders(tickId string, start, limit int, searchAdd
 		UpperBound: []byte(prefix + "~"),
 	})
 	if err != nil {
-		log.Printf("[MRC20] GetMrc20Holders: NewIter error: %v", err)
+		//log.Printf("[MRC20] GetMrc20Holders: NewIter error: %v", err)
 		return nil, err
 	}
 	defer iter.Close()
@@ -816,7 +1066,7 @@ func (pd *PebbleData) GetMrc20Holders(tickId string, start, limit int, searchAdd
 			balanceMap[utxo.ToAddress] = balanceMap[utxo.ToAddress].Add(utxo.AmtChange)
 		}
 	}
-	log.Printf("[MRC20] GetMrc20Holders: tickId=%s, totalUtxos=%d, matchedUtxos=%d, uniqueAddresses=%d", tickId, totalCount, matchCount, len(addressSet))
+	//log.Printf("[MRC20] GetMrc20Holders: tickId=%s, totalUtxos=%d, matchedUtxos=%d, uniqueAddresses=%d", tickId, totalCount, matchCount, len(addressSet))
 
 	// 转换为列表（包括余额为0的曾持有者）
 	var holders []Mrc20Holder
@@ -1350,4 +1600,336 @@ func (pd *PebbleData) DeleteTeleportPendingIn(coord, toAddress string) error {
 	}
 
 	return batch.Commit(pebble.Sync)
+}
+
+// ============== TransferPendingIn 相关方法 (用于跟踪普通转账接收方的 PendingInBalance) ==============
+
+// SaveTransferPendingIn 保存普通 transfer/native_transfer 接收方的 pending 余额记录
+func (pd *PebbleData) SaveTransferPendingIn(pendingIn *mrc20.TransferPendingIn) error {
+	data, err := sonic.Marshal(pendingIn)
+	if err != nil {
+		return fmt.Errorf("marshal transfer pending in error: %w", err)
+	}
+
+	batch := pd.Database.MrcDb.NewBatch()
+	defer batch.Close()
+
+	// 主键: transfer_pending_in_{txPoint}
+	key := fmt.Sprintf("transfer_pending_in_%s", pendingIn.TxPoint)
+	err = batch.Set([]byte(key), data, pebble.Sync)
+	if err != nil {
+		return fmt.Errorf("save transfer pending in error: %w", err)
+	}
+
+	// 索引: transfer_pending_in_addr_{toAddress}_{txPoint} - 用于按地址查询
+	addrKey := fmt.Sprintf("transfer_pending_in_addr_%s_%s", pendingIn.ToAddress, pendingIn.TxPoint)
+	err = batch.Set([]byte(addrKey), []byte(pendingIn.TxPoint), pebble.Sync)
+	if err != nil {
+		return fmt.Errorf("save transfer pending in address index error: %w", err)
+	}
+
+	return batch.Commit(pebble.Sync)
+}
+
+// GetTransferPendingInByTxPoint 根据 txPoint 获取 pending in 记录
+func (pd *PebbleData) GetTransferPendingInByTxPoint(txPoint string) (*mrc20.TransferPendingIn, error) {
+	key := fmt.Sprintf("transfer_pending_in_%s", txPoint)
+	value, closer, err := pd.Database.MrcDb.Get([]byte(key))
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+
+	var pendingIn mrc20.TransferPendingIn
+	err = sonic.Unmarshal(value, &pendingIn)
+	if err != nil {
+		return nil, fmt.Errorf("unmarshal transfer pending in error: %w", err)
+	}
+
+	return &pendingIn, nil
+}
+
+// GetTransferPendingInByAddress 获取指定地址的所有 transfer pending in 记录 (用于计算 PendingInBalance)
+func (pd *PebbleData) GetTransferPendingInByAddress(address string) ([]*mrc20.TransferPendingIn, error) {
+	var result []*mrc20.TransferPendingIn
+
+	prefix := fmt.Sprintf("transfer_pending_in_addr_%s_", address)
+	iter, err := pd.Database.MrcDb.NewIter(&pebble.IterOptions{
+		LowerBound: []byte(prefix),
+		UpperBound: []byte(prefix + "~"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		txPoint := string(iter.Value())
+		pendingIn, err := pd.GetTransferPendingInByTxPoint(txPoint)
+		if err != nil {
+			log.Println("GetTransferPendingInByAddress: get pending in error:", err)
+			continue
+		}
+		result = append(result, pendingIn)
+	}
+
+	return result, nil
+}
+
+// DeleteTransferPendingIn 删除 transfer pending in 记录 (出块确认后调用)
+func (pd *PebbleData) DeleteTransferPendingIn(txPoint, toAddress string) error {
+	batch := pd.Database.MrcDb.NewBatch()
+	defer batch.Close()
+
+	// 删除主记录
+	key := fmt.Sprintf("transfer_pending_in_%s", txPoint)
+	err := batch.Delete([]byte(key), pebble.Sync)
+	if err != nil && err != pebble.ErrNotFound {
+		return fmt.Errorf("delete transfer pending in error: %w", err)
+	}
+
+	// 删除地址索引
+	addrKey := fmt.Sprintf("transfer_pending_in_addr_%s_%s", toAddress, txPoint)
+	err = batch.Delete([]byte(addrKey), pebble.Sync)
+	if err != nil && err != pebble.ErrNotFound {
+		return fmt.Errorf("delete transfer pending in address index error: %w", err)
+	}
+
+	return batch.Commit(pebble.Sync)
+}
+
+// DeleteTransferPendingInByTxId 根据交易ID删除所有相关的 transfer pending in 记录
+func (pd *PebbleData) DeleteTransferPendingInByTxId(txId string) error {
+	// 遍历查找以该 txId 开头的所有记录
+	prefix := fmt.Sprintf("transfer_pending_in_%s:", txId)
+	iter, err := pd.Database.MrcDb.NewIter(&pebble.IterOptions{
+		LowerBound: []byte(prefix),
+		UpperBound: []byte(prefix + "~"),
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+
+	batch := pd.Database.MrcDb.NewBatch()
+	defer batch.Close()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		// 获取完整的 pendingIn 记录以获取 toAddress
+		pendingIn, err := pd.GetTransferPendingInByTxPoint(string(iter.Key()[len("transfer_pending_in_"):]))
+		if err != nil {
+			continue
+		}
+
+		// 删除主记录
+		batch.Delete(iter.Key(), pebble.Sync)
+
+		// 删除地址索引
+		addrKey := fmt.Sprintf("transfer_pending_in_addr_%s_%s", pendingIn.ToAddress, pendingIn.TxPoint)
+		batch.Delete([]byte(addrKey), pebble.Sync)
+	}
+
+	return batch.Commit(pebble.Sync)
+}
+
+// CleanMempoolMrc20ByTxIds 根据交易hash列表清理mempool阶段的MRC20数据
+// 这个函数在出块时调用，删除mempool阶段创建的数据，然后重新处理区块
+// 处理逻辑：
+// 1. 把发送方的TransferPending UTXO恢复为Available（Status=0, AmtChange恢复正数, OperationTx清空）
+// 2. 删除接收方在mempool创建的UTXO（BlockHeight=-1 且 OperationTx=txId）
+func (pd *PebbleData) CleanMempoolMrc20ByTxIds(txIds []string) error {
+	if len(txIds) == 0 {
+		return nil
+	}
+
+	// 构建txId集合用于快速查找
+	txIdSet := make(map[string]struct{})
+	for _, txId := range txIds {
+		txIdSet[txId] = struct{}{}
+	}
+
+	batch := pd.Database.MrcDb.NewBatch()
+	defer batch.Close()
+
+	// 遍历所有UTXO
+	prefix := []byte("mrc20_utxo_")
+	iter, err := pd.Database.MrcDb.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: append(prefix, 0xff),
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+
+	var restoredCount, deletedCount int
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		var utxo mrc20.Mrc20Utxo
+		if err := sonic.Unmarshal(iter.Value(), &utxo); err != nil {
+			continue
+		}
+
+		// 检查这个UTXO是否与区块内的交易相关
+		if _, ok := txIdSet[utxo.OperationTx]; !ok {
+			continue
+		}
+
+		mainKey := fmt.Sprintf("mrc20_utxo_%s", utxo.TxPoint)
+		inKey := fmt.Sprintf("mrc20_in_%s_%s_%s", utxo.ToAddress, utxo.Mrc20Id, utxo.TxPoint)
+		availableKey := fmt.Sprintf("available_utxo_%s_%s_%s_%s", utxo.Chain, utxo.ToAddress, utxo.Mrc20Id, utxo.TxPoint)
+
+		// 情况1: 发送方的TransferPending UTXO（原始UTXO被mempool修改）
+		// 特征：Status=TransferPending(2), AmtChange是负数, BlockHeight >= 0
+		if utxo.Status == mrc20.UtxoStatusTransferPending && utxo.BlockHeight >= 0 {
+			// 恢复为Available状态
+			utxo.Status = mrc20.UtxoStatusAvailable
+			// 恢复AmtChange为正数
+			if utxo.AmtChange.LessThan(decimal.Zero) {
+				utxo.AmtChange = utxo.AmtChange.Neg()
+			}
+			// 清空OperationTx
+			utxo.OperationTx = ""
+
+			// 保存恢复后的UTXO
+			data, err := sonic.Marshal(utxo)
+			if err != nil {
+				log.Printf("[ERROR] CleanMempoolMrc20ByTxIds: marshal error: %v", err)
+				continue
+			}
+			batch.Set([]byte(mainKey), data, pebble.Sync)
+			batch.Set([]byte(inKey), data, pebble.Sync)
+			batch.Set([]byte(availableKey), data, pebble.Sync)
+			restoredCount++
+			log.Printf("[DEBUG] CleanMempoolMrc20ByTxIds: restored UTXO %s to Available", utxo.TxPoint)
+		}
+
+		// 情况2: 接收方在mempool创建的UTXO
+		// 特征：BlockHeight=-1, Status=Available(0)
+		if utxo.BlockHeight == -1 && utxo.Status == mrc20.UtxoStatusAvailable {
+			// 删除这个UTXO
+			batch.Delete([]byte(mainKey), pebble.Sync)
+			batch.Delete([]byte(inKey), pebble.Sync)
+			batch.Delete([]byte(availableKey), pebble.Sync)
+			deletedCount++
+			log.Printf("[DEBUG] CleanMempoolMrc20ByTxIds: deleted mempool UTXO %s", utxo.TxPoint)
+		}
+	}
+
+	if restoredCount > 0 || deletedCount > 0 {
+		log.Printf("[INFO] CleanMempoolMrc20ByTxIds: restored %d UTXOs, deleted %d mempool UTXOs", restoredCount, deletedCount)
+	}
+
+	return batch.Commit(pebble.Sync)
+}
+
+// ConfirmPendingTransfersByTxIds 根据区块内的交易hash确认TransferPending状态的UTXO
+// 这个函数在出块时调用，处理mempool阶段创建的pending数据
+// 逻辑：
+// 1. 遍历所有TransferPending状态的UTXO
+// 2. 检查OperationTx是否在txIdSet中（说明这笔交易在当前区块内）
+// 3. 如果是，则：
+//   - 标记发送方UTXO为Spent
+//   - 更新接收方UTXO的BlockHeight（从-1改为实际区块高度）
+//   - 更新余额
+func (pd *PebbleData) ConfirmPendingTransfersByTxIds(txIdSet map[string]struct{}, chainName string, blockHeight int64, timestamp int64) error {
+	if len(txIdSet) == 0 {
+		return nil
+	}
+
+	// 遍历所有UTXO，找出TransferPending状态且OperationTx在txIdSet中的
+	prefix := []byte("mrc20_utxo_")
+	iter, err := pd.Database.MrcDb.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: append(prefix, 0xff),
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+
+	// 收集需要处理的转账
+	type pendingTransfer struct {
+		spentUtxo    mrc20.Mrc20Utxo  // 发送方的UTXO
+		receiverUtxo *mrc20.Mrc20Utxo // 接收方的UTXO（可能为nil）
+	}
+	transfers := make(map[string]*pendingTransfer) // operationTx -> transfer
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		var utxo mrc20.Mrc20Utxo
+		if err := sonic.Unmarshal(iter.Value(), &utxo); err != nil {
+			continue
+		}
+
+		// 跳过不相关的链
+		if utxo.Chain != chainName {
+			continue
+		}
+
+		// 检查OperationTx是否在txIdSet中
+		if _, ok := txIdSet[utxo.OperationTx]; !ok {
+			continue
+		}
+
+		// 发送方的TransferPending UTXO
+		if utxo.Status == mrc20.UtxoStatusTransferPending {
+			opTx := utxo.OperationTx
+			if transfers[opTx] == nil {
+				transfers[opTx] = &pendingTransfer{}
+			}
+			transfers[opTx].spentUtxo = utxo
+			log.Printf("[DEBUG] ConfirmPendingTransfersByTxIds: found pending UTXO %s for tx %s", utxo.TxPoint, opTx)
+		}
+
+		// 接收方的mempool UTXO（BlockHeight=-1, Status=Available）
+		if utxo.BlockHeight == -1 && utxo.Status == mrc20.UtxoStatusAvailable {
+			opTx := utxo.OperationTx
+			if transfers[opTx] == nil {
+				transfers[opTx] = &pendingTransfer{}
+			}
+			utxoCopy := utxo
+			transfers[opTx].receiverUtxo = &utxoCopy
+			log.Printf("[DEBUG] ConfirmPendingTransfersByTxIds: found mempool UTXO %s for tx %s", utxo.TxPoint, opTx)
+		}
+	}
+
+	if len(transfers) == 0 {
+		return nil
+	}
+
+	log.Printf("[INFO] ConfirmPendingTransfersByTxIds: confirming %d transfers", len(transfers))
+
+	// 处理每笔转账
+	for txId, transfer := range transfers {
+		if transfer.spentUtxo.TxPoint == "" {
+			log.Printf("[WARN] ConfirmPendingTransfersByTxIds: tx %s has no spent UTXO", txId)
+			continue
+		}
+
+		// 准备spent和created列表
+		spentUtxo := transfer.spentUtxo
+		// 恢复AmtChange为正数（mempool阶段可能设为负数）
+		if spentUtxo.AmtChange.LessThan(decimal.Zero) {
+			spentUtxo.AmtChange = spentUtxo.AmtChange.Neg()
+		}
+		spentUtxos := []*mrc20.Mrc20Utxo{&spentUtxo}
+
+		var createdUtxos []*mrc20.Mrc20Utxo
+		if transfer.receiverUtxo != nil {
+			createdUtxos = []*mrc20.Mrc20Utxo{transfer.receiverUtxo}
+		} else {
+			log.Printf("[WARN] ConfirmPendingTransfersByTxIds: tx %s has no receiver UTXO", txId)
+			continue
+		}
+
+		// 调用ProcessNativeTransferSuccess处理余额更新
+		err := pd.ProcessNativeTransferSuccess(txId, chainName, blockHeight, spentUtxos, createdUtxos)
+		if err != nil {
+			log.Printf("[ERROR] ConfirmPendingTransfersByTxIds: ProcessNativeTransferSuccess failed for tx %s: %v", txId, err)
+		} else {
+			log.Printf("[INFO] ConfirmPendingTransfersByTxIds: confirmed transfer tx %s", txId)
+		}
+	}
+
+	return nil
 }
