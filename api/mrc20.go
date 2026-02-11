@@ -15,7 +15,6 @@ import (
 	"github.com/bytedance/sonic"
 	"github.com/cockroachdb/pebble"
 	"github.com/gin-gonic/gin"
-	"github.com/shopspring/decimal"
 )
 
 func mrc20JsonApi(r *gin.Engine) {
@@ -41,6 +40,21 @@ func mrc20JsonApi(r *gin.Engine) {
 	adminGroup.GET("/recalculate-balance/:chain/:address/:tickId", recalculateBalance)
 	adminGroup.GET("/verify-balance/:chain/:address/:tickId", verifyBalance)
 	adminGroup.GET("/fix-pending/:chain", fixPendingUtxos)
+
+	// Teleport 诊断和修复接口
+	adminGroup.GET("/teleport/list-pending", listPendingTeleports)
+	adminGroup.GET("/teleport/diagnose/:coord", diagnoseTeleport)
+	adminGroup.GET("/teleport/check-arrival/:pinId", checkArrivalByPinId)
+	adminGroup.GET("/teleport/check-asset-index/:assetOutpoint", checkAssetIndex)
+	adminGroup.POST("/teleport/fix/:coord", fixTeleport)
+
+	// Teleport V2 接口
+	adminGroup.GET("/teleport/v2/list", listTeleportTransactionsV2)
+	adminGroup.GET("/teleport/v2/detail/:id", getTeleportTransactionV2)
+
+	// 资产验证接口
+	adminGroup.GET("/verify/supply/:tickId", verifySupply)
+	adminGroup.GET("/verify/all", verifyAllSupply)
 
 	// 快照管理接口
 	adminGroup.POST("/snapshot/create", createSnapshot)
@@ -165,211 +179,70 @@ func getBalanceByAddress(ctx *gin.Context) {
 	// 可选的 chain 参数，如果不传则查询所有链
 	chainFilter := ctx.Query("chain")
 
-	// 新架构：使用 AccountBalance 表
-	balanceMap := make(map[string]*mrc20.Mrc20Balance)
-	var nameList []string
+	// 💡 新架构：基于 UTXO 实时计算余额，不使用 AccountBalance 表
+	log.Printf("[API] 💡 使用 UTXO 实时计算余额: address=%s, chain=%s", address, chainFilter)
 
-	// 获取该地址的所有余额（跨链查询）
-	// 遍历所有可能的链
-	chains := []string{"btc", "doge", "mvc"}
+	var balanceList []*man.MRC20Balance
+
 	if chainFilter != "" {
-		// 如果指定了链，只查该链
-		chains = []string{chainFilter}
-	}
-
-	for _, chain := range chains {
-		prefix := []byte(fmt.Sprintf("balance_%s_%s_", chain, address))
-		iter, err := man.PebbleStore.Database.MrcDb.NewIter(&pebble.IterOptions{
-			LowerBound: prefix,
-			UpperBound: append(prefix, 0xff),
-		})
+		// 查询单条链
+		balances, err := man.GetAddressBalances(chainFilter, address)
 		if err != nil {
-			continue
-		}
-
-		for iter.First(); iter.Valid(); iter.Next() {
-			var accountBalance mrc20.Mrc20AccountBalance
-			if err := sonic.Unmarshal(iter.Value(), &accountBalance); err != nil {
-				continue
-			}
-
-			// 使用 tickId + chain 作为唯一键，支持同一 tick 在不同链上的余额
-			key := fmt.Sprintf("%s_%s", accountBalance.TickId, accountBalance.Chain)
-
-			// 转换为 API 响应格式
-			// 注意：PendingInBalance 不使用 accountBalance.PendingIn，因为可能不准确
-			// 后面会从 TeleportPendingIn + TransferPendingIn + UTXO 表实时计算
-			balance := &mrc20.Mrc20Balance{
-				Id:                accountBalance.TickId,
-				Name:              accountBalance.Tick,
-				Chain:             accountBalance.Chain,
-				Balance:           accountBalance.Balance,
-				PendingOutBalance: accountBalance.PendingOut,
-				PendingInBalance:  decimal.Zero, // 初始化为 0，后面实时计算
-			}
-
-			balanceMap[key] = balance
-			nameList = append(nameList, key)
-		}
-		iter.Close()
-	}
-
-	// 【修复】从 TeleportPendingIn 表实时计算 pendingIn（teleport 接收方的待转入余额）
-	// 不使用 AccountBalance.PendingIn，因为可能不准确
-	teleportPendingIns, _ := man.PebbleStore.GetTeleportPendingInByAddress(address)
-	for _, pendingIn := range teleportPendingIns {
-		key := fmt.Sprintf("%s_%s", pendingIn.TickId, pendingIn.Chain)
-		if balance, ok := balanceMap[key]; ok {
-			balance.PendingInBalance = balance.PendingInBalance.Add(pendingIn.Amount)
+			log.Printf("[API] 计算余额失败: chain=%s, address=%s, error=%v", chainFilter, address, err)
 		} else {
-			balanceMap[key] = &mrc20.Mrc20Balance{
-				Id:               pendingIn.TickId,
-				Name:             pendingIn.Tick,
-				Chain:            pendingIn.Chain,
-				PendingInBalance: pendingIn.Amount,
-			}
-			nameList = append(nameList, key)
+			balanceList = append(balanceList, balances...)
 		}
-	}
-
-	// 查询该地址的 transfer pending in（普通转账接收方的待转入余额）
-	// 注意：TransferPendingIn 表可能数据不全，后面会从 UTXO 表实时计算补充
-	transferPendingIns, _ := man.PebbleStore.GetTransferPendingInByAddress(address)
-	for _, pendingIn := range transferPendingIns {
-		key := fmt.Sprintf("%s_%s", pendingIn.TickId, pendingIn.Chain)
-		if balance, ok := balanceMap[key]; ok {
-			balance.PendingInBalance = balance.PendingInBalance.Add(pendingIn.Amount)
-		} else {
-			balanceMap[key] = &mrc20.Mrc20Balance{
-				Id:               pendingIn.TickId,
-				Name:             pendingIn.Tick,
-				Chain:            pendingIn.Chain,
-				PendingInBalance: pendingIn.Amount,
-			}
-			nameList = append(nameList, key)
-		}
-	}
-
-	// 实时计算 pendingOut：扫描该地址的所有 UTXO
-	// - pendingOut: Status=Pending 的 UTXO（被花费的待确认）
-	// 【注意】不再从 UTXO 扫描 mempool pendingIn，因为 TransferPendingIn 表已经包含了
-	for _, chain := range chains {
-		// 直接扫描该地址的所有 UTXO（所有 tick）
-		// 前缀：mrc20_in_{address}_
-		prefix := []byte(fmt.Sprintf("mrc20_in_%s_", address))
-		iter, err := man.PebbleStore.Database.MrcDb.NewIter(&pebble.IterOptions{
-			LowerBound: prefix,
-			UpperBound: append(prefix, 0xff),
-		})
+	} else {
+		// 查询所有链
+		allBalances, err := man.GetAllChainsBalances(address)
 		if err != nil {
-			continue
+			ctx.JSON(http.StatusOK, respond.ErrServiceError)
+			return
 		}
 
-		// 按 tick 分组统计 pendingOut
-		tickPendingOut := make(map[string]decimal.Decimal)
-		tickInfo := make(map[string]struct{ tickName, tickChain string })
-
-		for iter.First(); iter.Valid(); iter.Next() {
-			var utxo mrc20.Mrc20Utxo
-			if err := sonic.Unmarshal(iter.Value(), &utxo); err != nil {
-				continue
-			}
-
-			// 只处理 ToAddress=address 的 UTXO
-			if utxo.ToAddress != address {
-				continue
-			}
-
-			// 只处理当前链的 UTXO
-			if utxo.Chain != chain {
-				continue
-			}
-
-			tickId := utxo.Mrc20Id
-			if tickId == "" {
-				continue
-			}
-
-			// 记录 tick 信息
-			if _, ok := tickInfo[tickId]; !ok {
-				tickInfo[tickId] = struct{ tickName, tickChain string }{utxo.Tick, utxo.Chain}
-			}
-
-			// 计算 pendingOut：被花费的待确认 UTXO（Status=Pending）
-			if utxo.Status == mrc20.UtxoStatusTeleportPending || utxo.Status == mrc20.UtxoStatusTransferPending {
-				amtAbs := utxo.AmtChange
-				if amtAbs.LessThan(decimal.Zero) {
-					amtAbs = amtAbs.Neg()
-				}
-				tickPendingOut[tickId] = tickPendingOut[tickId].Add(amtAbs)
-			}
-		}
-		iter.Close()
-
-		// 更新 balanceMap 的 pendingOut，并修正 balance（扣除被花费的 pending UTXO）
-		for tickId, info := range tickInfo {
-			key := fmt.Sprintf("%s_%s", tickId, chain)
-			balance, ok := balanceMap[key]
-			if !ok {
-				// 如果 balanceMap 中没有这个 tick，创建一个新的
-				balance = &mrc20.Mrc20Balance{
-					Id:    tickId,
-					Name:  info.tickName,
-					Chain: chain,
-				}
-				balanceMap[key] = balance
-				nameList = append(nameList, key)
-			}
-
-			pendingOut := tickPendingOut[tickId]
-			balance.PendingOutBalance = pendingOut
-
-			// 【修复】balance 应该是"当前可用的已确认余额"
-			// 如果 UTXO 已经被花费（Pending 状态），这部分不应该算在 balance 里
-			// balance = 存储的已确认余额 - 正在被花费的金额
-			if pendingOut.GreaterThan(decimal.Zero) {
-				balance.Balance = balance.Balance.Sub(pendingOut)
-				if balance.Balance.LessThan(decimal.Zero) {
-					balance.Balance = decimal.Zero
-				}
-			}
+		// 合并所有链的余额
+		for _, balances := range allBalances {
+			balanceList = append(balanceList, balances...)
 		}
 	}
 
-	if len(nameList) == 0 {
+	if len(balanceList) == 0 {
 		ctx.JSON(http.StatusOK, respond.ErrNoDataFound)
 		return
 	}
 
-	// 排序
-	sort.Strings(nameList)
+	// 转换为 API 响应格式（兼容旧接口）
+	apiBalances := make([]*mrc20.Mrc20Balance, 0, len(balanceList))
+	for _, b := range balanceList {
+		apiBalances = append(apiBalances, &mrc20.Mrc20Balance{
+			Id:                b.TickId,
+			Name:              b.Tick,
+			Chain:             b.Chain,
+			Balance:           b.Balance,
+			PendingOutBalance: b.PendingOut,
+			PendingInBalance:  b.PendingIn,
+		})
+	}
+
+	// 排序（按 tickId）
+	sort.Slice(apiBalances, func(i, j int) bool {
+		return apiBalances[i].Id < apiBalances[j].Id
+	})
 
 	// 分页
-	total := int64(len(nameList))
+	total := int64(len(apiBalances))
 	start := int(cursor)
 	end := int(cursor + size)
-	if start >= len(nameList) {
-		ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{"list": []mrc20.Mrc20Balance{}, "total": total}))
+	if start >= len(apiBalances) {
+		ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{"list": []*mrc20.Mrc20Balance{}, "total": total}))
 		return
 	}
-	if end > len(nameList) {
-		end = len(nameList)
+	if end > len(apiBalances) {
+		end = len(apiBalances)
 	}
-	nameList = nameList[start:end]
+	apiBalances = apiBalances[start:end]
 
-	var result []mrc20.Mrc20Balance
-	for _, name := range nameList {
-		if balance, ok := balanceMap[name]; ok {
-			// 只返回有余额的（任意类型余额大于0）
-			if balance.Balance.GreaterThan(decimal.Zero) ||
-				balance.PendingInBalance.GreaterThan(decimal.Zero) ||
-				balance.PendingOutBalance.GreaterThan(decimal.Zero) {
-				result = append(result, *balance)
-			}
-		}
-	}
-
-	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{"list": result, "total": total}))
+	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{"list": apiBalances, "total": total}))
 }
 func getHistoryByTx(ctx *gin.Context) {
 	txId := ctx.Query("txId")
@@ -446,103 +319,24 @@ func getAddressBalance(ctx *gin.Context) {
 		chain = "btc" // 默认 BTC
 	}
 
-	// 新架构：使用 AccountBalance 表
-	accountBalance, err := man.PebbleStore.GetMrc20AccountBalance(chain, address, tickId)
+	// 💡 新架构：基于 UTXO 实时计算余额，不使用 AccountBalance 表
+	log.Printf("[API] 💡 使用 UTXO 实时计算余额: chain=%s, address=%s, tickId=%s", chain, address, tickId)
+
+	balance, err := man.CalculateBalanceFromUTXO(chain, address, tickId)
 	if err != nil {
-		// 余额不存在，说明没有已确认余额
-		// 从 TeleportPendingIn + TransferPendingIn 表计算 pendingIn
-		pendingIn := decimal.Zero
-		pendingOut := decimal.Zero
-
-		// 【修复】只从 TeleportPendingIn 和 TransferPendingIn 表累加
-		teleportPendingIns, _ := man.PebbleStore.GetTeleportPendingInByAddress(address)
-		for _, p := range teleportPendingIns {
-			if p.TickId == tickId && p.Chain == chain {
-				pendingIn = pendingIn.Add(p.Amount)
-			}
-		}
-		transferPendingIns, _ := man.PebbleStore.GetTransferPendingInByAddress(address)
-		for _, p := range transferPendingIns {
-			if p.TickId == tickId && p.Chain == chain {
-				pendingIn = pendingIn.Add(p.Amount)
-			}
-		}
-
-		// 【修复】balance 是已确认余额，没有 AccountBalance 表示没有已确认余额，返回 0
+		log.Printf("[API] 计算余额失败: %v", err)
 		ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{
-			"balance":    "0", // 没有已确认余额
-			"pendingIn":  pendingIn.String(),
-			"pendingOut": pendingOut.String(),
+			"balance":    "0",
+			"pendingIn":  "0",
+			"pendingOut": "0",
 		}))
 		return
 	}
 
-	// 实时计算 pendingOut：扫描该地址的所有 UTXO
-	// - pendingOut: Status=Pending 的 UTXO（被花费的待确认）
-	pendingOut := decimal.Zero
-	prefix := []byte(fmt.Sprintf("mrc20_in_%s_%s_", address, tickId))
-	iter, err := man.PebbleStore.Database.MrcDb.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: append(prefix, 0xff),
-	})
-	if err == nil {
-		for iter.First(); iter.Valid(); iter.Next() {
-			var utxo mrc20.Mrc20Utxo
-			if err := sonic.Unmarshal(iter.Value(), &utxo); err != nil {
-				continue
-			}
-
-			// 只处理 ToAddress=address 的 UTXO
-			if utxo.ToAddress != address {
-				continue
-			}
-
-			// 计算 pendingOut：被花费的待确认 UTXO（Status=Pending）
-			if utxo.Status == mrc20.UtxoStatusTeleportPending || utxo.Status == mrc20.UtxoStatusTransferPending {
-				amtAbs := utxo.AmtChange
-				if amtAbs.LessThan(decimal.Zero) {
-					amtAbs = amtAbs.Neg()
-				}
-				pendingOut = pendingOut.Add(amtAbs)
-			}
-		}
-		iter.Close()
-	}
-
-	// 【修复】计算 pendingIn：从 TeleportPendingIn + TransferPendingIn 表实时计算
-	// 不从 UTXO 扫描，因为 TransferPendingIn 表已经包含了 mempool UTXO 的信息
-	// 不使用 accountBalance.PendingIn，因为可能不准确
-	pendingIn := decimal.Zero
-
-	// 累加 teleport pending in（teleport 接收方的待转入余额）
-	teleportPendingIns, _ := man.PebbleStore.GetTeleportPendingInByAddress(address)
-	for _, p := range teleportPendingIns {
-		if p.TickId == tickId && p.Chain == chain {
-			pendingIn = pendingIn.Add(p.Amount)
-		}
-	}
-
-	// 累加 transfer pending in（普通转账接收方的待转入余额）
-	transferPendingIns, _ := man.PebbleStore.GetTransferPendingInByAddress(address)
-	for _, p := range transferPendingIns {
-		if p.TickId == tickId && p.Chain == chain {
-			pendingIn = pendingIn.Add(p.Amount)
-		}
-	}
-
-	// 【修复】balance 应该是"当前可用的已确认余额"
-	// 如果 UTXO 已经被花费（Pending 状态），这部分不应该算在 balance 里
-	// balance = 存储的已确认余额 - 正在被花费的金额
-	confirmedBalance := accountBalance.Balance.Sub(pendingOut)
-	if confirmedBalance.LessThan(decimal.Zero) {
-		confirmedBalance = decimal.Zero
-	}
-
 	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{
-		"balance":    confirmedBalance.String(),
-		"pendingIn":  pendingIn.String(),
-		"pendingOut": pendingOut.String(),
-		"utxoCount":  accountBalance.UtxoCount,
+		"balance":    balance.Balance.String(),
+		"pendingIn":  balance.PendingIn.String(),
+		"pendingOut": balance.PendingOut.String(),
 	}))
 }
 
@@ -1366,4 +1160,357 @@ func deleteSnapshot(ctx *gin.Context) {
 		"snapshotId": snapshotID,
 		"message":    "Snapshot deleted successfully",
 	}))
+}
+
+// listPendingTeleports 列出所有pending状态的teleport
+// GET /api/mrc20/admin/teleport/list-pending
+func listPendingTeleports(ctx *gin.Context) {
+	pendingList, err := man.PebbleStore.GetAllPendingTeleports()
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, respond.ApiError(0, "Failed to get pending teleports: "+err.Error()))
+		return
+	}
+
+	type TeleportInfo struct {
+		PinId           string              `json:"pinId"`
+		TxId            string              `json:"txId"`
+		Coord           string              `json:"coord"`
+		TickId          string              `json:"tickId"`
+		Amount          string              `json:"amount"`
+		FromAddress     string              `json:"fromAddress"`
+		SourceChain     string              `json:"sourceChain"`
+		TargetChain     string              `json:"targetChain"`
+		BlockHeight     int64               `json:"blockHeight"`
+		Status          int                 `json:"status"`
+		AssetOutpoint   string              `json:"assetOutpoint"`
+		ArrivalExists   bool                `json:"arrivalExists"`
+		ArrivalStatus   mrc20.ArrivalStatus `json:"arrivalStatus,omitempty"`
+		ArrivalHeight   int64               `json:"arrivalHeight,omitempty"`
+		PendingInExists bool                `json:"pendingInExists"`
+		UtxoStatus      int                 `json:"utxoStatus,omitempty"`
+		Problem         string              `json:"problem,omitempty"`
+	}
+
+	result := make([]TeleportInfo, 0, len(pendingList))
+
+	for _, pending := range pendingList {
+		info := TeleportInfo{
+			PinId:         pending.PinId,
+			TxId:          pending.TxId,
+			Coord:         pending.Coord,
+			TickId:        pending.TickId,
+			Amount:        pending.Amount,
+			FromAddress:   pending.FromAddress,
+			SourceChain:   pending.SourceChain,
+			TargetChain:   pending.TargetChain,
+			BlockHeight:   pending.BlockHeight,
+			Status:        pending.Status,
+			AssetOutpoint: pending.AssetOutpoint,
+		}
+
+		// 检查arrival
+		arrival, err := man.PebbleStore.GetMrc20ArrivalByPinId(pending.Coord)
+		if err == nil && arrival != nil {
+			info.ArrivalExists = true
+			info.ArrivalStatus = arrival.Status
+			info.ArrivalHeight = arrival.BlockHeight
+		}
+
+		// 检查TeleportPendingIn
+		pendingIn, err := man.PebbleStore.GetTeleportPendingInByCoord(pending.Coord)
+		if err == nil && pendingIn != nil {
+			info.PendingInExists = true
+		}
+
+		// 检查源UTXO
+		utxo, err := man.PebbleStore.GetMrc20UtxoByTxPoint(pending.AssetOutpoint, false)
+		if err == nil && utxo != nil {
+			info.UtxoStatus = utxo.Status
+		}
+
+		// 诊断问题
+		if pending.Status == 0 {
+			if !info.ArrivalExists {
+				info.Problem = "Arrival not found, teleport is waiting"
+			} else if info.ArrivalHeight <= 0 {
+				info.Problem = "Arrival still in mempool"
+			} else if pending.BlockHeight <= 0 {
+				info.Problem = "Teleport blockHeight not updated (stuck)"
+			} else if info.ArrivalStatus != mrc20.ArrivalStatusPending {
+				info.Problem = fmt.Sprintf("Arrival status is not pending (status=%d)", info.ArrivalStatus)
+			} else if !info.PendingInExists {
+				info.Problem = "TeleportPendingIn not created (receiver has no pendingIn)"
+			} else {
+				info.Problem = "Ready to process (both confirmed)"
+			}
+		}
+
+		result = append(result, info)
+	}
+
+	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{
+		"total":     len(result),
+		"teleports": result,
+	}))
+}
+
+// diagnoseTeleport 诊断指定的teleport
+// GET /api/mrc20/admin/teleport/diagnose/:coord
+func diagnoseTeleport(ctx *gin.Context) {
+	coord := ctx.Param("coord")
+	if coord == "" {
+		ctx.JSON(http.StatusBadRequest, respond.ApiError(0, "coord parameter is required"))
+		return
+	}
+
+	// 查找PendingTeleport
+	pending, err := man.PebbleStore.GetPendingTeleportByCoord(coord)
+	var pendingInfo map[string]interface{}
+	if err != nil || pending == nil {
+		pendingInfo = map[string]interface{}{"exists": false}
+	} else {
+		pendingInfo = map[string]interface{}{
+			"exists":        true,
+			"pinId":         pending.PinId,
+			"txId":          pending.TxId,
+			"status":        pending.Status,
+			"blockHeight":   pending.BlockHeight,
+			"amount":        pending.Amount,
+			"assetOutpoint": pending.AssetOutpoint,
+			"sourceChain":   pending.SourceChain,
+			"targetChain":   pending.TargetChain,
+			"fromAddress":   pending.FromAddress,
+		}
+	}
+
+	// 查找Arrival - 通过coord (PinId)
+	arrivalByCoord, err := man.PebbleStore.GetMrc20ArrivalByPinId(coord)
+	var arrivalInfo map[string]interface{}
+
+	if err != nil || arrivalByCoord == nil {
+		arrivalInfo = map[string]interface{}{
+			"exists": false,
+			"note":   "Arrival not found by coord (PinId)",
+		}
+	} else {
+		arrivalInfo = map[string]interface{}{
+			"exists":      true,
+			"pinId":       arrivalByCoord.PinId,
+			"txId":        arrivalByCoord.TxId,
+			"status":      arrivalByCoord.Status,
+			"blockHeight": arrivalByCoord.BlockHeight,
+			"amount":      arrivalByCoord.Amount.String(),
+			"toAddress":   arrivalByCoord.ToAddress,
+			"chain":       arrivalByCoord.Chain,
+		}
+	}
+
+	// 通过assetOutpoint查询arrival
+	var arrivalByAsset *mrc20.Mrc20Arrival
+	if pending != nil && pending.AssetOutpoint != "" {
+		arrivalByAsset, _ = man.PebbleStore.GetMrc20ArrivalByAssetOutpoint(pending.AssetOutpoint)
+	}
+
+	var arrivalByAssetInfo map[string]interface{}
+	if arrivalByAsset != nil {
+		arrivalByAssetInfo = map[string]interface{}{
+			"exists":      true,
+			"pinId":       arrivalByAsset.PinId,
+			"txId":        arrivalByAsset.TxId,
+			"status":      arrivalByAsset.Status,
+			"blockHeight": arrivalByAsset.BlockHeight,
+			"amount":      arrivalByAsset.Amount.String(),
+			"toAddress":   arrivalByAsset.ToAddress,
+			"chain":       arrivalByAsset.Chain,
+			"note":        "Found by assetOutpoint instead of coord",
+		}
+	} else {
+		arrivalByAssetInfo = map[string]interface{}{
+			"exists": false,
+			"note":   "Arrival not found by assetOutpoint either",
+		}
+	}
+
+	// 查找TeleportPendingIn
+	pendingIn, err := man.PebbleStore.GetTeleportPendingInByCoord(coord)
+	var pendingInInfo map[string]interface{}
+	if err != nil || pendingIn == nil {
+		pendingInInfo = map[string]interface{}{"exists": false}
+	} else {
+		pendingInInfo = map[string]interface{}{
+			"exists":    true,
+			"amount":    pendingIn.Amount.String(),
+			"toAddress": pendingIn.ToAddress,
+			"chain":     pendingIn.Chain,
+		}
+	}
+
+	// 诊断结果
+	diagnosis := []string{}
+	canFix := false
+
+	// 决定使用哪个arrival进行诊断
+	var arrivalForDiagnosis *mrc20.Mrc20Arrival
+	if arrivalByCoord != nil {
+		arrivalForDiagnosis = arrivalByCoord
+	} else if arrivalByAsset != nil {
+		arrivalForDiagnosis = arrivalByAsset
+		diagnosis = append(diagnosis, "⚠️ Arrival found by assetOutpoint, but coord mismatch!")
+		diagnosis = append(diagnosis, fmt.Sprintf("   Expected coord: %s", coord))
+		diagnosis = append(diagnosis, fmt.Sprintf("   Actual arrival PinId: %s", arrivalByAsset.PinId))
+	}
+
+	if pending == nil {
+		diagnosis = append(diagnosis, "❌ PendingTeleport not found")
+	} else if pending.Status != 0 {
+		diagnosis = append(diagnosis, fmt.Sprintf("ℹ️ PendingTeleport status: %d (0=pending, 1=completed, -1=invalid)", pending.Status))
+	} else {
+		if arrivalForDiagnosis == nil {
+			diagnosis = append(diagnosis, "⏳ Arrival not found by coord or assetOutpoint, teleport is waiting")
+		} else if arrivalForDiagnosis.BlockHeight <= 0 {
+			diagnosis = append(diagnosis, "⏳ Arrival still in mempool")
+		} else if pending.BlockHeight <= 0 {
+			diagnosis = append(diagnosis, "⚠️ Teleport blockHeight not updated (may be stuck)")
+		} else if arrivalForDiagnosis.Status != mrc20.ArrivalStatusPending {
+			diagnosis = append(diagnosis, fmt.Sprintf("❌ Arrival status is not pending (status=%d)", arrivalForDiagnosis.Status))
+		} else if pendingIn == nil {
+			diagnosis = append(diagnosis, "⚠️ TeleportPendingIn not created (receiver has no pendingIn)")
+			canFix = true
+		} else {
+			diagnosis = append(diagnosis, "✅ Both confirmed and PendingIn exists, ready to process")
+			canFix = true
+		}
+	}
+
+	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{
+		"coord":          coord,
+		"pending":        pendingInfo,
+		"arrival":        arrivalInfo,
+		"arrivalByAsset": arrivalByAssetInfo,
+		"pendingIn":      pendingInInfo,
+		"diagnosis":      diagnosis,
+		"canFix":         canFix,
+	}))
+}
+
+// checkAssetIndex 检查assetOutpoint索引指向的PinId（用于调试）
+// GET /api/mrc20/admin/teleport/check-asset-index/:assetOutpoint
+func checkAssetIndex(ctx *gin.Context) {
+	assetOutpoint := ctx.Param("assetOutpoint")
+	if assetOutpoint == "" {
+		ctx.JSON(http.StatusBadRequest, respond.ApiError(0, "assetOutpoint parameter is required"))
+		return
+	}
+
+	result := gin.H{
+		"assetOutpoint": assetOutpoint,
+	}
+
+	// 1. 查询索引
+	assetKey := fmt.Sprintf("arrival_asset_%s", assetOutpoint)
+	pinIdBytes, closer, err := man.PebbleStore.Database.MrcDb.Get([]byte(assetKey))
+
+	if err != nil {
+		result["indexExists"] = false
+		result["indexError"] = err.Error()
+	} else {
+		closer.Close()
+		indexedPinId := string(pinIdBytes)
+		result["indexExists"] = true
+		result["indexedPinId"] = indexedPinId
+
+		// 2. 查询这个PinId对应的arrival是否存在
+		arrival, err2 := man.PebbleStore.GetMrc20ArrivalByPinId(indexedPinId)
+		if err2 != nil {
+			result["arrivalExists"] = false
+			result["arrivalError"] = err2.Error()
+		} else if arrival == nil {
+			result["arrivalExists"] = false
+			result["arrivalError"] = "arrival is nil"
+		} else {
+			result["arrivalExists"] = true
+			result["arrival"] = gin.H{
+				"pinId":         arrival.PinId,
+				"txId":          arrival.TxId,
+				"assetOutpoint": arrival.AssetOutpoint,
+				"amount":        arrival.Amount.String(),
+				"toAddress":     arrival.ToAddress,
+				"chain":         arrival.Chain,
+				"status":        arrival.Status,
+				"blockHeight":   arrival.BlockHeight,
+			}
+		}
+	}
+
+	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", result))
+}
+
+// checkArrivalByPinId 检查指定PinId的arrival是否存在（用于调试）
+// GET /api/mrc20/admin/teleport/check-arrival/:pinId
+func checkArrivalByPinId(ctx *gin.Context) {
+	pinId := ctx.Param("pinId")
+	if pinId == "" {
+		ctx.JSON(http.StatusBadRequest, respond.ApiError(0, "pinId parameter is required"))
+		return
+	}
+
+	// 尝试直接从数据库读取
+	arrival, err := man.PebbleStore.GetMrc20ArrivalByPinId(pinId)
+
+	result := gin.H{
+		"pinId":       pinId,
+		"queryMethod": "GetMrc20ArrivalByPinId",
+	}
+
+	if err != nil {
+		result["exists"] = false
+		result["error"] = err.Error()
+	} else if arrival == nil {
+		result["exists"] = false
+		result["error"] = "arrival is nil"
+	} else {
+		result["exists"] = true
+		result["arrival"] = gin.H{
+			"pinId":         arrival.PinId,
+			"txId":          arrival.TxId,
+			"assetOutpoint": arrival.AssetOutpoint,
+			"amount":        arrival.Amount.String(),
+			"tickId":        arrival.TickId,
+			"tick":          arrival.Tick,
+			"locationIndex": arrival.LocationIndex,
+			"toAddress":     arrival.ToAddress,
+			"chain":         arrival.Chain,
+			"sourceChain":   arrival.SourceChain,
+			"status":        arrival.Status,
+			"msg":           arrival.Msg,
+			"blockHeight":   arrival.BlockHeight,
+			"timestamp":     arrival.Timestamp,
+		}
+	}
+
+	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", result))
+}
+
+// fixTeleport 修复指定的teleport
+// POST /api/mrc20/admin/teleport/fix/:coord
+func fixTeleport(ctx *gin.Context) {
+	coord := ctx.Param("coord")
+	if coord == "" {
+		ctx.JSON(http.StatusBadRequest, respond.ApiError(0, "coord parameter is required"))
+		return
+	}
+
+	// TODO: 重新实现 DiagnosePendingTeleport 函数
+	// success, message := man.DiagnosePendingTeleport(coord)
+	success := false
+	message := "DiagnosePendingTeleport function temporarily disabled"
+
+	if success {
+		ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "Teleport fixed successfully", gin.H{
+			"coord":   coord,
+			"message": message,
+		}))
+	} else {
+		ctx.JSON(http.StatusBadRequest, respond.ApiError(0, message))
+	}
 }

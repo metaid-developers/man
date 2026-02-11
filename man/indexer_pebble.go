@@ -2,7 +2,6 @@ package man
 
 import (
 	"fmt"
-	"log"
 	"strconv"
 
 	"manindexer/adapter/dogecoin"
@@ -485,18 +484,18 @@ func (pd *PebbleData) handleMrc20(chainName string, height int64, pinList *[]*pi
 	var mrc20List []*pin.PinInscription
 	mrc20TransferPinTx := make(map[string]struct{})
 
-	log.Printf("[DEBUG] handleMrc20: height=%d, pinList count=%d", height, len(*pinList))
+	//log.Printf("[DEBUG] handleMrc20: height=%d, pinList count=%d", height, len(*pinList))
 	for _, pinNode := range *pinList {
 		if strings.HasPrefix(pinNode.Path, "/ft/mrc20/") {
 			mrc20List = append(mrc20List, pinNode)
-			log.Printf("[DEBUG] handleMrc20: found MRC20 PIN, path=%s, id=%s, genesisTx=%s", pinNode.Path, pinNode.Id, pinNode.GenesisTransaction)
+			//log.Printf("[DEBUG] handleMrc20: found MRC20 PIN, path=%s, id=%s, genesisTx=%s", pinNode.Path, pinNode.Id, pinNode.GenesisTransaction)
 			if pinNode.Path == "/ft/mrc20/transfer" {
 				mrc20TransferPinTx[pinNode.GenesisTransaction] = struct{}{}
-				log.Printf("[DEBUG] handleMrc20: added Transfer PIN to mrc20TransferPinTx: %s", pinNode.GenesisTransaction)
+				//log.Printf("[DEBUG] handleMrc20: added Transfer PIN to mrc20TransferPinTx: %s", pinNode.GenesisTransaction)
 			}
 		}
 	}
-	log.Printf("[DEBUG] handleMrc20: mrc20TransferPinTx count=%d", len(mrc20TransferPinTx))
+	//log.Printf("[DEBUG] handleMrc20: mrc20TransferPinTx count=%d", len(mrc20TransferPinTx))
 
 	//log.Printf("[MRC20] Found %d MRC20 PINs in block %d", len(mrc20List), height)
 

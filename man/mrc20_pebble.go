@@ -296,7 +296,7 @@ func (pd *PebbleData) CleanMempoolNativeTransfer(pendingUtxos []*mrc20.Mrc20Utxo
 			continue
 		}
 
-		log.Printf("[DEBUG] CleanMempoolNativeTransfer: cleaning UTXO %s, operationTx=%s", utxo.TxPoint, utxo.OperationTx)
+		//log.Printf("[DEBUG] CleanMempoolNativeTransfer: cleaning UTXO %s, operationTx=%s", utxo.TxPoint, utxo.OperationTx)
 
 		// 1. 恢复发送方 UTXO 为 Available 状态
 		// AmtChange 如果是负数需要取绝对值
@@ -325,7 +325,7 @@ func (pd *PebbleData) CleanMempoolNativeTransfer(pendingUtxos []*mrc20.Mrc20Utxo
 		batch.Set([]byte(inKey), data, pebble.Sync)
 		batch.Set([]byte(availableKey), data, pebble.Sync)
 
-		log.Printf("[DEBUG] CleanMempoolNativeTransfer: restored UTXO %s to Available, amt=%s", utxo.TxPoint, originalAmt)
+		//log.Printf("[DEBUG] CleanMempoolNativeTransfer: restored UTXO %s to Available, amt=%s", utxo.TxPoint, originalAmt)
 
 		// 2. 删除 mempool 阶段创建的接收方 UTXO
 		// 接收方 UTXO 的 TxPoint 格式是 {operationTx}:0, {operationTx}:1, ...
@@ -355,7 +355,7 @@ func (pd *PebbleData) CleanMempoolNativeTransfer(pendingUtxos []*mrc20.Mrc20Utxo
 				// 【修复】跳过 TeleportPending 状态的 UTXO
 				// 这些 UTXO 已经被 teleport 处理，不应该被清理
 				if receiverUtxo.Status == mrc20.UtxoStatusTeleportPending {
-					log.Printf("[DEBUG] CleanMempoolNativeTransfer: skipping TeleportPending UTXO %s", receiverTxPoint)
+					//log.Printf("[DEBUG] CleanMempoolNativeTransfer: skipping TeleportPending UTXO %s", receiverTxPoint)
 					continue
 				}
 
@@ -368,7 +368,7 @@ func (pd *PebbleData) CleanMempoolNativeTransfer(pendingUtxos []*mrc20.Mrc20Utxo
 					batch.Delete([]byte(receiverInKey), pebble.Sync)
 					batch.Delete([]byte(receiverAvailableKey), pebble.Sync)
 
-					log.Printf("[DEBUG] CleanMempoolNativeTransfer: deleted mempool receiver UTXO %s, toAddr=%s", receiverTxPoint, receiverUtxo.ToAddress)
+					//log.Printf("[DEBUG] CleanMempoolNativeTransfer: deleted mempool receiver UTXO %s, toAddr=%s", receiverTxPoint, receiverUtxo.ToAddress)
 				}
 			}
 		}
@@ -549,7 +549,7 @@ func (pd *PebbleData) GetMrc20Shovel(pinIds []string, mrc20Id string) (map[strin
 	return result, nil
 }
 
-// CheckOperationtx 检查交易是否已处理
+// CheckOperationtx 检查交易是否已处理（区分mempool和block状态）
 func (pd *PebbleData) CheckOperationtx(txId string, isMempool bool) (*mrc20.Mrc20Utxo, error) {
 	// 方法1：尝试查找 mrc20_op_tx_ 索引（向后兼容）
 	key := fmt.Sprintf("mrc20_op_tx_%s", txId)
@@ -559,7 +559,12 @@ func (pd *PebbleData) CheckOperationtx(txId string, isMempool bool) (*mrc20.Mrc2
 		var utxo mrc20.Mrc20Utxo
 		err = sonic.Unmarshal(value, &utxo)
 		if err == nil {
-			return &utxo, nil
+			// 检查BlockHeight匹配状态：mempool(-1) vs block(>0)
+			if isMempool && utxo.BlockHeight == -1 {
+				return &utxo, nil
+			} else if !isMempool && utxo.BlockHeight > 0 {
+				return &utxo, nil
+			}
 		}
 	}
 
@@ -584,13 +589,16 @@ func (pd *PebbleData) CheckOperationtx(txId string, isMempool bool) (*mrc20.Mrc2
 
 		// 检查 TxPoint 是否包含目标 txId
 		// TxPoint 格式: txid:vout 或 txid:vout_out
-		if strings.HasPrefix(utxo.TxPoint, txId+":") {
-			return &utxo, nil
-		}
+		isTxPointMatch := strings.HasPrefix(utxo.TxPoint, txId+":")
+		isOperationTxMatch := utxo.OperationTx == txId
 
-		// 也检查 OperationTx 字段
-		if utxo.OperationTx == txId {
-			return &utxo, nil
+		if isTxPointMatch || isOperationTxMatch {
+			// 检查BlockHeight匹配状态：mempool(-1) vs block(>0)
+			if isMempool && utxo.BlockHeight == -1 {
+				return &utxo, nil
+			} else if !isMempool && utxo.BlockHeight > 0 {
+				return &utxo, nil
+			}
 		}
 	}
 
@@ -619,7 +627,7 @@ func (pd *PebbleData) CheckOperationtxByTxPoint(txPoint string, isMempool bool) 
 	return &utxo, nil
 }
 
-// CheckOperationtxAll 通过交易 ID 查找该交易的所有 UTXO
+// CheckOperationtxAll 通过交易 ID 查找该交易的所有 UTXO（区分mempool和block状态）
 func (pd *PebbleData) CheckOperationtxAll(txId string, isMempool bool) ([]*mrc20.Mrc20Utxo, error) {
 	var result []*mrc20.Mrc20Utxo
 
@@ -643,10 +651,17 @@ func (pd *PebbleData) CheckOperationtxAll(txId string, isMempool bool) ([]*mrc20
 
 		// 检查 TxPoint 是否包含目标 txId
 		// TxPoint 格式: txid:vout 或 txid:vout_out
-		if strings.HasPrefix(utxo.TxPoint, txId+":") {
-			result = append(result, &utxo)
-		} else if utxo.OperationTx == txId {
-			result = append(result, &utxo)
+		isTxPointMatch := strings.HasPrefix(utxo.TxPoint, txId+":")
+		isOperationTxMatch := utxo.OperationTx == txId
+
+		if isTxPointMatch || isOperationTxMatch {
+			// 根据isMempool参数过滤状态
+			if isMempool && utxo.BlockHeight == -1 {
+				result = append(result, &utxo)
+			} else if !isMempool && utxo.BlockHeight >= 0 {
+				// block阶段：包括BlockHeight=0和>0的记录
+				result = append(result, &utxo)
+			}
 		}
 	}
 
@@ -851,6 +866,7 @@ type Mrc20HistoryRecord struct {
 	ToAddress   string `json:"toAddress"`
 	OperationTx string `json:"operationTx"`
 	Verify      bool   `json:"verify"`
+	Msg         string `json:"msg"` // 验证失败原因
 }
 
 // GetMrc20AddressHistory 获取某地址在某 tick 的收支流水历史
@@ -879,6 +895,7 @@ func (pd *PebbleData) GetMrc20AddressHistory(mrc20Id, address string, start, lim
 			ToAddress:   r.ToAddress,
 			Mrc20Id:     mrc20Id,
 			Verify:      r.Verify,
+			Msg:         r.Msg,
 		}
 		// Direction 通过 Status 传递：out 方向设为 -1
 		if r.Direction == "out" {
@@ -952,23 +969,37 @@ func (pd *PebbleData) GetMrc20AddressHistoryWithDirection(mrc20Id, address strin
 					ToAddress:   utxo.ToAddress,
 					OperationTx: txid, // In: 显示创建这笔收入的交易（TxPoint的txid）
 					Verify:      utxo.Verify,
+					Msg:         utxo.Msg,
 				})
 			}
 		}
 
-		// 支出记录：只有当 Status == -1（已消费）时才显示支出
-		if utxo.Status == -1 {
-			// 应用 statusFilter：如果指定了 status=-1，才显示支出记录
-			// 如果 statusFilter 为其他值（如 0, 1, 2），不显示支出记录
-			if (statusFilter == nil || *statusFilter == -1) && (verifyFilter == nil || utxo.Verify == *verifyFilter) {
+		// 支出记录：当Status为Spent(-1)或TransferPending(2)时显示支出
+		// mempool阶段：TransferPending的输入UTXO（AmtChange<0）表示待支出
+		// block阶段：Spent表示已支出
+		shouldShowOut := false
+		if utxo.Status == -1 { // 已消费
+			shouldShowOut = true
+		} else if utxo.Status == 2 && utxo.AmtChange.IsNegative() { // mempool阶段的输入UTXO
+			shouldShowOut = true
+		}
+
+		if shouldShowOut {
+			// 应用 statusFilter：如果指定了 status，才显示匹配的支出记录
+			if (statusFilter == nil || *statusFilter == utxo.Status) && (verifyFilter == nil || utxo.Verify == *verifyFilter) {
 				keyOut := utxo.TxPoint + "_out"
 				if !recordMap[keyOut] {
 					recordMap[keyOut] = true
+					// 对于mempool阶段的输入UTXO，AmtChange为负数，需要转为正数显示
+					amtChange := utxo.AmtChange
+					if utxo.AmtChange.IsNegative() {
+						amtChange = utxo.AmtChange.Abs()
+					}
 					allRecords = append(allRecords, &Mrc20HistoryRecord{
 						TxPoint:     utxo.TxPoint,
 						MrcOption:   utxo.MrcOption,
 						Direction:   "out",
-						AmtChange:   utxo.AmtChange.String(),
+						AmtChange:   amtChange.String(),
 						Status:      utxo.Status,
 						Chain:       utxo.Chain,
 						BlockHeight: utxo.BlockHeight,
@@ -977,6 +1008,7 @@ func (pd *PebbleData) GetMrc20AddressHistoryWithDirection(mrc20Id, address strin
 						ToAddress:   utxo.ToAddress,
 						OperationTx: utxo.OperationTx, // Out: 显示消费这笔资产的交易
 						Verify:      utxo.Verify,
+						Msg:         utxo.Msg,
 					})
 				}
 			}
@@ -1801,7 +1833,7 @@ func (pd *PebbleData) CleanMempoolMrc20ByTxIds(txIds []string) error {
 			batch.Set([]byte(inKey), data, pebble.Sync)
 			batch.Set([]byte(availableKey), data, pebble.Sync)
 			restoredCount++
-			log.Printf("[DEBUG] CleanMempoolMrc20ByTxIds: restored UTXO %s to Available", utxo.TxPoint)
+			//log.Printf("[DEBUG] CleanMempoolMrc20ByTxIds: restored UTXO %s to Available", utxo.TxPoint)
 		}
 
 		// 情况2: 接收方在mempool创建的UTXO
@@ -1812,7 +1844,7 @@ func (pd *PebbleData) CleanMempoolMrc20ByTxIds(txIds []string) error {
 			batch.Delete([]byte(inKey), pebble.Sync)
 			batch.Delete([]byte(availableKey), pebble.Sync)
 			deletedCount++
-			log.Printf("[DEBUG] CleanMempoolMrc20ByTxIds: deleted mempool UTXO %s", utxo.TxPoint)
+			//log.Printf("[DEBUG] CleanMempoolMrc20ByTxIds: deleted mempool UTXO %s", utxo.TxPoint)
 		}
 	}
 
@@ -1878,7 +1910,7 @@ func (pd *PebbleData) ConfirmPendingTransfersByTxIds(txIdSet map[string]struct{}
 				transfers[opTx] = &pendingTransfer{}
 			}
 			transfers[opTx].spentUtxo = utxo
-			log.Printf("[DEBUG] ConfirmPendingTransfersByTxIds: found pending UTXO %s for tx %s", utxo.TxPoint, opTx)
+			//log.Printf("[DEBUG] ConfirmPendingTransfersByTxIds: found pending UTXO %s for tx %s", utxo.TxPoint, opTx)
 		}
 
 		// 接收方的mempool UTXO（BlockHeight=-1, Status=Available）
@@ -1889,7 +1921,7 @@ func (pd *PebbleData) ConfirmPendingTransfersByTxIds(txIdSet map[string]struct{}
 			}
 			utxoCopy := utxo
 			transfers[opTx].receiverUtxo = &utxoCopy
-			log.Printf("[DEBUG] ConfirmPendingTransfersByTxIds: found mempool UTXO %s for tx %s", utxo.TxPoint, opTx)
+			//log.Printf("[DEBUG] ConfirmPendingTransfersByTxIds: found mempool UTXO %s for tx %s", utxo.TxPoint, opTx)
 		}
 	}
 

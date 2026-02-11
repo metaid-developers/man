@@ -35,9 +35,10 @@
                   <th scope="col">Amount</th>
                   <th scope="col">TxPoint</th>
                   <th scope="col">Operation</th>
+                  <th scope="col">Status</th>
                   <th scope="col">Counterparty</th>
                   <th scope="col">Chain</th>
-                  <th scope="col">Note</th>
+                  <th scope="col">Message</th>
                 </tr>
               </thead>
 
@@ -87,6 +88,15 @@
                     <span style="background: #6b7280; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">{{ $v.TxType }}</span>
                     {{ end }}
                   </td>
+                  <td>
+                    {{ if eq $v.Status 1 }}
+                    <span style="background: #10b981; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">✓ Success</span>
+                    {{ else if eq $v.Status -1 }}
+                    <span style="background: #ef4444; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">✗ Failed</span>
+                    {{ else }}
+                    <span style="background: #6b7280; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">Unknown</span>
+                    {{ end }}
+                  </td>
                   <td style="font-size: 12px;">
                     {{ if eq $v.Direction "in" }}
                       {{ if $v.FromAddress }}from: {{ $v.FromAddress | formatAddress }}{{ end }}
@@ -95,7 +105,9 @@
                     {{ end }}
                   </td>
                   <td style="font-size: 11px;">{{ $v.Chain }}</td>
-                  <td style="font-size: 11px; max-width: 150px;">{{ $v.Msg }}</td>
+                  <td style="font-size: 11px; max-width: 200px; word-wrap: break-word; color: {{ if $v.Msg }}#ef4444{{ else }}#666{{ end }};">
+                    {{ if $v.Msg }}{{ $v.Msg }}{{ else }}-{{ end }}
+                  </td>
                 </tr>
                 {{ end }}
               </tbody>

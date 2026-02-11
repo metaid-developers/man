@@ -22,12 +22,12 @@ mrc20Only = true
 [btc]
 initialHeight = 0
 mrc20Height = 1
-rpcHost = "127.0.0.1:18443"
+rpcHost = "192.168.1.24:18443"
 rpcUser = "test"
 rpcPass = "test"
 rpcHttpPostMode = true
 rpcDisableTLS = true
-zmqHost = "tcp://127.0.0.1:28333"
+zmqHost = "tcp://192.168.1.24:28333"
 popCutNum = 0
 
 # MVC Configuration
@@ -49,12 +49,12 @@ popCutNum = 21
 initialHeight = 0
 mrc20Height = 1
 # For Dogecoin Regtest (active):
-rpcHost = "127.0.0.1:18332"
+rpcHost = "192.168.1.24:18332"
 rpcUser = "dogeuser"
 rpcPass = "dogepass"
 rpcHttpPostMode = true
 rpcDisableTLS = true
-zmqHost = "tcp://127.0.0.1:28444"
+zmqHost = "tcp://192.168.1.24:28444"
 popCutNum = 0
 
 

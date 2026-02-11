@@ -40,6 +40,7 @@ const (
 	UtxoStatusAvailable       = 0  // 可用
 	UtxoStatusTeleportPending = 1  // 等待跃迁中 (teleport transfer mempool)
 	UtxoStatusTransferPending = 2  // 等待转账确认中 (普通/native transfer mempool)
+	UtxoStatusMintPending     = 3  // 等待mint确认中 (mint mempool)
 	UtxoStatusSpent           = -1 // 已消耗
 )
 

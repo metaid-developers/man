@@ -1,6 +1,7 @@
 package man
 
 import (
+	"log"
 	"manindexer/common"
 	"manindexer/pin"
 	"strings"
@@ -26,12 +27,16 @@ func handleMempoolPin(pinNode *pin.PinInscription) {
 
 	// 处理 mempool 中的 MRC20
 	if strings.HasPrefix(pinNode.Path, "/ft/mrc20/") && isModuleEnabled("mrc20") {
+		log.Printf("[Mempool] 🎯 MRC20 PIN detected, calling handleMempoolMrc20: path=%s, pinId=%s", pinNode.Path, pinNode.Id)
 		handleMempoolMrc20(pinNode)
 	}
 }
 
 // handleMempoolMrc20 处理 mempool 中的 MRC20 交易
 func handleMempoolMrc20(pinNode *pin.PinInscription) {
+	log.Printf("[Mempool] 📨 handleMempoolMrc20: path=%s, pinId=%s, txId=%s, chain=%s",
+		pinNode.Path, pinNode.Id, pinNode.GenesisTransaction, pinNode.ChainName)
+
 	mrc20List := []*pin.PinInscription{pinNode}
 	mrc20TransferPinTx := make(map[string]struct{})
 

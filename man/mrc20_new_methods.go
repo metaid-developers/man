@@ -170,15 +170,22 @@ func (pd *PebbleData) SaveMrc20Transaction(tx *mrc20.Mrc20Transaction) error {
 		batch.Set(addrKey, key, pebble.Sync)
 	}
 
+	// 按 TxId 索引: tx_txid_{txId}_{txPoint}（用于UpdateMrc20TransactionBlockHeight查找所有相关记录）
+	if tx.TxId != "" {
+		txIdKey := []byte(fmt.Sprintf("tx_txid_%s_%s", tx.TxId, txPointForKey))
+		batch.Set(txIdKey, key, pebble.Sync)
+	}
+
 	return batch.Commit(pebble.Sync)
 }
 
 // UpdateMrc20TransactionBlockHeight 更新流水记录的区块高度
 // 用于 mempool 交易出块后更新 BlockHeight（从 -1 更新为实际区块高度）
 func (pd *PebbleData) UpdateMrc20TransactionBlockHeight(txId string, blockHeight int64) error {
-	// 遍历查找该 txId 相关的所有流水记录
-	// 主键格式: tx_{txPoint}，其中 txPoint = txId:vout 或 txId:vout_out
-	prefix := []byte(fmt.Sprintf("tx_%s:", txId))
+	// 通过 TxId 索引查找该交易的所有流水记录（包括out记录）
+	prefix := []byte(fmt.Sprintf("tx_txid_%s_", txId))
+
+	log.Printf("[DEBUG] UpdateMrc20TransactionBlockHeight: txId=%s, blockHeight=%d, prefix=%s", txId, blockHeight, string(prefix))
 
 	iter, err := pd.Database.MrcDb.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
@@ -192,18 +199,35 @@ func (pd *PebbleData) UpdateMrc20TransactionBlockHeight(txId string, blockHeight
 	batch := pd.Database.MrcDb.NewBatch()
 	defer batch.Close()
 
+	updatedCount := 0
 	for iter.First(); iter.Valid(); iter.Next() {
-		key := iter.Key()
-		var tx mrc20.Mrc20Transaction
-		if err := sonic.Unmarshal(iter.Value(), &tx); err != nil {
+		// iter.Value() 是主记录的 key (tx_{txPoint})
+		mainKey := iter.Value()
+
+		// 读取主记录数据
+		mainValue, closer, err := pd.Database.MrcDb.Get(mainKey)
+		if err != nil {
+			log.Printf("[WARN] UpdateMrc20TransactionBlockHeight: get main record failed for key=%s: %v", string(mainKey), err)
 			continue
 		}
+
+		var tx mrc20.Mrc20Transaction
+		if err := sonic.Unmarshal(mainValue, &tx); err != nil {
+			closer.Close()
+			log.Printf("[WARN] UpdateMrc20TransactionBlockHeight: unmarshal failed for key=%s: %v", string(mainKey), err)
+			continue
+		}
+		closer.Close()
+
+		log.Printf("[DEBUG] UpdateMrc20TransactionBlockHeight: found tx=%s, direction=%s, currentHeight=%d", tx.TxPoint, tx.Direction, tx.BlockHeight)
 
 		// 只更新 BlockHeight = -1 的记录（mempool 阶段创建的）
 		if tx.BlockHeight != -1 {
+			log.Printf("[DEBUG] UpdateMrc20TransactionBlockHeight: skip tx=%s (already confirmed, height=%d)", tx.TxPoint, tx.BlockHeight)
 			continue
 		}
 
+		log.Printf("[DEBUG] UpdateMrc20TransactionBlockHeight: updating tx=%s from height=%d to %d", tx.TxPoint, tx.BlockHeight, blockHeight)
 		oldBlockHeight := tx.BlockHeight
 		tx.BlockHeight = blockHeight
 
@@ -215,7 +239,7 @@ func (pd *PebbleData) UpdateMrc20TransactionBlockHeight(txId string, blockHeight
 		}
 
 		// 更新主记录
-		batch.Set(key, newData, pebble.Sync)
+		batch.Set(mainKey, newData, pebble.Sync)
 
 		// 删除旧的索引（带旧的 blockHeight=-1）
 		// 注意：blockHeight=-1 使用 "999999999999" 表示 mempool
@@ -236,16 +260,19 @@ func (pd *PebbleData) UpdateMrc20TransactionBlockHeight(txId string, blockHeight
 		// 创建新的索引（带新的 blockHeight）
 		newBlockHeightStr := fmt.Sprintf("%012d", blockHeight)
 		newTickKey := []byte(fmt.Sprintf("tx_tick_%s_%s_%012d_%s", tx.TickId, newBlockHeightStr, tx.Timestamp, tx.TxPoint))
-		batch.Set(newTickKey, key, pebble.Sync)
+		batch.Set(newTickKey, mainKey, pebble.Sync)
 
 		if tx.Address != "" {
 			newAddrKey := []byte(fmt.Sprintf("tx_addr_%s_%s_%s_%012d_%s", tx.Address, tx.TickId, newBlockHeightStr, tx.Timestamp, tx.TxPoint))
-			batch.Set(newAddrKey, key, pebble.Sync)
+			batch.Set(newAddrKey, mainKey, pebble.Sync)
 		}
+
+		updatedCount++
 
 		//log.Printf("[MRC20] Updated transaction %s blockHeight: %d -> %d", tx.TxPoint, oldBlockHeight, blockHeight)
 	}
 
+	log.Printf("[DEBUG] UpdateMrc20TransactionBlockHeight: txId=%s, updated %d records", txId, updatedCount)
 	return batch.Commit(pebble.Sync)
 }
 
@@ -502,12 +529,20 @@ func (pd *PebbleData) UpdateUtxosBlockHeight(utxos []*mrc20.Mrc20Utxo, blockHeig
 		return nil
 	}
 
-	// 筛选需要更新的 UTXO（BlockHeight=-1 且 Status=0）
+	// 筛选需要更新的 UTXO（BlockHeight=-1的所有状态）
 	var toUpdate []mrc20.Mrc20Utxo
 	for _, utxo := range utxos {
-		if utxo.BlockHeight == -1 && utxo.Status == mrc20.UtxoStatusAvailable {
+		if utxo.BlockHeight == -1 {
 			updated := *utxo
 			updated.BlockHeight = blockHeight
+			// 同时更新状态：TransferPending(2) -> Spent(-1) 或 Available(0)
+			if utxo.Status == mrc20.UtxoStatusTransferPending && utxo.AmtChange.IsNegative() {
+				// 输入UTXO（AmtChange<0）从TransferPending转为Spent
+				updated.Status = mrc20.UtxoStatusSpent
+			} else if utxo.Status == mrc20.UtxoStatusTransferPending && utxo.AmtChange.IsPositive() {
+				// 输出UTXO（AmtChange>0）从TransferPending转为Available
+				updated.Status = mrc20.UtxoStatusAvailable
+			}
 			toUpdate = append(toUpdate, updated)
 		}
 	}
@@ -658,8 +693,42 @@ func (pd *PebbleData) BatchUpdateMrc20State(update *Mrc20StateUpdate) error {
 
 // ProcessMintSuccess 处理 Mint 成功后的状态更新
 func (pd *PebbleData) ProcessMintSuccess(utxo *mrc20.Mrc20Utxo) error {
-	// 1. 更新账户余额
-	err := pd.UpdateMrc20AccountBalance(
+	// 从 TxPoint 提取 TxId (格式: txid:vout)
+	txId := utxo.OperationTx
+	if txId == "" && strings.Contains(utxo.TxPoint, ":") {
+		txId = strings.Split(utxo.TxPoint, ":")[0]
+	}
+
+	// 检查是否已存在mempool记录，如果存在则更新
+	existingKey := []byte(fmt.Sprintf("tx_%s", utxo.TxPoint))
+	existingData, closer, err := pd.Database.MrcDb.Get(existingKey)
+
+	if err == nil {
+		// 记录已存在，更新为block确认状态
+		closer.Close()
+
+		var existingTx mrc20.Mrc20Transaction
+		if err := sonic.Unmarshal(existingData, &existingTx); err == nil {
+			// 更新状态为成功确认
+			existingTx.Status = 1
+			existingTx.BlockHeight = utxo.BlockHeight
+			existingTx.Msg = "Mint successful"
+
+			// 清理mempool索引并重新保存
+			if err := pd.updateTransactionFromMempoolToBlock(&existingTx); err != nil {
+				log.Printf("[ERROR] updateTransactionFromMempoolToBlock failed: %v", err)
+				return err
+			}
+		}
+	} else {
+		// 记录不存在，创建新记录（正常的block处理）
+		if err := pd.createMintSuccessRecord(utxo, txId); err != nil {
+			return err
+		}
+	}
+
+	// 更新账户余额（无论是更新还是新建记录都需要）
+	err = pd.UpdateMrc20AccountBalance(
 		utxo.Chain,
 		utxo.ToAddress,
 		utxo.Mrc20Id,
@@ -668,7 +737,7 @@ func (pd *PebbleData) ProcessMintSuccess(utxo *mrc20.Mrc20Utxo) error {
 		decimal.Zero,   // deltaPendingOut
 		decimal.Zero,   // deltaPendingIn
 		1,              // deltaUtxoCount
-		utxo.OperationTx,
+		txId,
 		utxo.BlockHeight,
 		utxo.Timestamp,
 	)
@@ -677,10 +746,26 @@ func (pd *PebbleData) ProcessMintSuccess(utxo *mrc20.Mrc20Utxo) error {
 		return err
 	}
 
-	// 2. 写入交易流水 (mint 只有一条收入记录)
+	return nil
+}
+
+// updateTransactionFromMempoolToBlock 将交易记录从mempool状态更新为block确认状态
+func (pd *PebbleData) updateTransactionFromMempoolToBlock(tx *mrc20.Mrc20Transaction) error {
+	// 先清理mempool索引
+	if err := pd.cleanMempoolTransactionIndexes(tx.TxPoint, tx.Address, tx.TickId); err != nil {
+		log.Printf("[WARN] Failed to clean mempool indexes: %v", err)
+	}
+
+	// 重新保存记录（会自动创建新的block索引）
+	return pd.SaveMrc20Transaction(tx)
+}
+
+// createMintSuccessRecord 创建mint成功记录
+func (pd *PebbleData) createMintSuccessRecord(utxo *mrc20.Mrc20Utxo, txId string) error {
+	// 创建交易流水 (mint 只有一条收入记录)
 	createdUtxos, _ := json.Marshal([]string{utxo.TxPoint})
 	tx := &mrc20.Mrc20Transaction{
-		TxId:         utxo.OperationTx,
+		TxId:         txId,
 		TxPoint:      utxo.TxPoint,
 		PinId:        utxo.PinId,
 		TickId:       utxo.Mrc20Id,
@@ -696,10 +781,104 @@ func (pd *PebbleData) ProcessMintSuccess(utxo *mrc20.Mrc20Utxo) error {
 		BlockHeight:  utxo.BlockHeight,
 		Timestamp:    utxo.Timestamp,
 		CreatedUtxos: string(createdUtxos),
-		Msg:          utxo.Msg,
+		Msg:          "Mint successful",
 		Status:       1,
 	}
 	return pd.SaveMrc20Transaction(tx)
+}
+
+// ProcessMintMempool 处理 Mempool 阶段的 Mint 记录
+// 只保存历史记录，不更新余额或其他状态
+func (pd *PebbleData) ProcessMintMempool(utxo *mrc20.Mrc20Utxo) error {
+	// 从 TxPoint 提取 TxId (格式: txid:vout)
+	txId := utxo.OperationTx
+	if txId == "" && strings.Contains(utxo.TxPoint, ":") {
+		txId = strings.Split(utxo.TxPoint, ":")[0]
+	}
+
+	// 检查是否已经存在这个 mint 的流水记录，避免重复创建
+	existingKey := []byte(fmt.Sprintf("tx_%s", utxo.TxPoint))
+	_, closer, err := pd.Database.MrcDb.Get(existingKey)
+	if err == nil {
+		// 记录已存在，跳过
+		closer.Close()
+		return nil
+	}
+
+	// 为 mempool 中的 mint 创建交易流水记录
+	var status int
+	var msg string
+	if utxo.Verify {
+		status = 0 // pending状态：验证通过，等待确认
+		msg = "Pending confirmation"
+	} else {
+		status = -1 // 验证失败
+		msg = utxo.Msg
+	}
+
+	tx := &mrc20.Mrc20Transaction{
+		TxId:        txId,
+		TxPoint:     utxo.TxPoint,
+		PinId:       utxo.PinId,
+		TickId:      utxo.Mrc20Id,
+		Tick:        utxo.Tick,
+		TxType:      "mint",
+		Direction:   "in", // mint 总是收入方向
+		Address:     utxo.ToAddress,
+		ToAddress:   utxo.ToAddress,
+		Amount:      utxo.AmtChange,
+		IsChange:    false,
+		Chain:       utxo.Chain,
+		BlockHeight: -1, // mempool阶段使用-1
+		Timestamp:   utxo.Timestamp,
+		Msg:         msg,
+		Status:      status,
+	}
+	return pd.SaveMrc20Transaction(tx)
+}
+
+// cleanMempoolTransactionIndexes 清理mempool阶段的交易索引
+// 在block确认阶段调用，避免重复索引
+func (pd *PebbleData) cleanMempoolTransactionIndexes(txPoint, address, tickId string) error {
+	batch := pd.Database.MrcDb.NewBatch()
+	defer batch.Close()
+
+	// 清理 tick 索引：tx_tick_{tickId}_999999999999_{timestamp}_{txPoint}
+	// 使用前缀扫描找到对应的mempool索引
+	tickPrefix := []byte(fmt.Sprintf("tx_tick_%s_999999999999_", tickId))
+	iter, err := pd.Database.MrcDb.NewIter(&pebble.IterOptions{
+		LowerBound: tickPrefix,
+		UpperBound: append(tickPrefix, 0xff),
+	})
+	if err == nil {
+		defer iter.Close()
+		for iter.First(); iter.Valid(); iter.Next() {
+			key := string(iter.Key())
+			if strings.HasSuffix(key, "_"+txPoint) {
+				batch.Delete(iter.Key(), pebble.Sync)
+				break
+			}
+		}
+	}
+
+	// 清理地址索引：tx_addr_{address}_{tickId}_999999999999_{timestamp}_{txPoint}
+	addrPrefix := []byte(fmt.Sprintf("tx_addr_%s_%s_999999999999_", address, tickId))
+	addrIter, err := pd.Database.MrcDb.NewIter(&pebble.IterOptions{
+		LowerBound: addrPrefix,
+		UpperBound: append(addrPrefix, 0xff),
+	})
+	if err == nil {
+		defer addrIter.Close()
+		for addrIter.First(); addrIter.Valid(); addrIter.Next() {
+			key := string(addrIter.Key())
+			if strings.HasSuffix(key, "_"+txPoint) {
+				batch.Delete(addrIter.Key(), pebble.Sync)
+				break
+			}
+		}
+	}
+
+	return batch.Commit(pebble.Sync)
 }
 
 // ProcessMintFailure 处理 Mint 失败后的记录保存
@@ -711,6 +890,39 @@ func (pd *PebbleData) ProcessMintFailure(utxo *mrc20.Mrc20Utxo) error {
 		txId = strings.Split(utxo.TxPoint, ":")[0]
 	}
 
+	// 检查是否已存在mempool记录，如果存在则更新
+	existingKey := []byte(fmt.Sprintf("tx_%s", utxo.TxPoint))
+	existingData, closer, err := pd.Database.MrcDb.Get(existingKey)
+
+	if err == nil {
+		// 记录已存在，更新为失败状态
+		closer.Close()
+
+		var existingTx mrc20.Mrc20Transaction
+		if err := sonic.Unmarshal(existingData, &existingTx); err == nil {
+			// 更新状态为失败
+			existingTx.Status = -1
+			existingTx.BlockHeight = utxo.BlockHeight
+			existingTx.Msg = utxo.Msg
+
+			// 清理mempool索引并重新保存
+			if err := pd.updateTransactionFromMempoolToBlock(&existingTx); err != nil {
+				log.Printf("[ERROR] updateTransactionFromMempoolToBlock failed: %v", err)
+				return err
+			}
+		}
+	} else {
+		// 记录不存在，创建新的失败记录
+		if err := pd.createMintFailureRecord(utxo, txId); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// createMintFailureRecord 创建mint失败记录
+func (pd *PebbleData) createMintFailureRecord(utxo *mrc20.Mrc20Utxo, txId string) error {
 	// 为失败的 mint 创建交易流水记录
 	tx := &mrc20.Mrc20Transaction{
 		TxId:        txId,
@@ -876,74 +1088,94 @@ func (pd *PebbleData) ProcessTransferSuccess(
 		toAddressForOut = realRecipients[0] + fmt.Sprintf(" (+%d)", len(realRecipients)-1)
 	}
 
-	// 4.1 为发送方记录支出流水 (每个 spent UTXO 一条 out 记录)
-	for _, utxo := range spentUtxos {
-		tx := &mrc20.Mrc20Transaction{
-			TxId:         pinNode.GenesisTransaction,
-			TxPoint:      utxo.TxPoint + "_out", // 使用 _out 后缀区分同一 UTXO 的支出记录
-			PinId:        pinNode.Id,
-			TickId:       utxo.Mrc20Id,
-			Tick:         utxo.Tick,
-			TxType:       "transfer",
-			Direction:    "out", // 支出
-			Address:      utxo.ToAddress,
-			FromAddress:  utxo.ToAddress,
-			ToAddress:    toAddressForOut, // 显示真正的接收方
-			Amount:       utxo.AmtChange,
-			IsChange:     false,
-			Chain:        pinNode.ChainName,
-			BlockHeight:  pinNode.GenesisHeight,
-			Timestamp:    pinNode.Timestamp,
-			SpentUtxos:   string(spentJson),
-			CreatedUtxos: string(createdJson),
-			Msg:          utxo.Msg,
-			Status:       1,
-		}
-		if err := pd.SaveMrc20Transaction(tx); err != nil {
-			log.Printf("SaveMrc20Transaction (out) error: %v", err)
-			return err
+	// 检查是否mempool阶段已创建过Transaction记录
+	// 如果已存在，说明mempool阶段已处理，只需要更新余额，不再创建Transaction记录
+	skipTransactionRecords := false
+	if len(spentUtxos) > 0 {
+		// 通过tx_txid索引检查是否已有记录
+		testPrefix := []byte(fmt.Sprintf("tx_txid_%s_", pinNode.GenesisTransaction))
+		iter, err := pd.Database.MrcDb.NewIter(&pebble.IterOptions{
+			LowerBound: testPrefix,
+			UpperBound: append(testPrefix, 0xff),
+		})
+		if err == nil {
+			if iter.First() {
+				// 找到记录，说明mempool阶段已处理
+				skipTransactionRecords = true
+				log.Printf("[DEBUG] ProcessTransferSuccess: mempool记录已存在，跳过Transaction记录创建, tx=%s", pinNode.GenesisTransaction)
+			}
+			iter.Close()
 		}
 	}
 
-	// 4.2 为接收方记录收入流水 (每个 created UTXO 一条 in 记录)
-	for _, utxo := range createdUtxos {
-		// 判断是否是找零 (接收方地址 == 发送方地址)
-		isChange := utxo.ToAddress == fromAddress
-
-		tx := &mrc20.Mrc20Transaction{
-			TxId:         pinNode.GenesisTransaction,
-			TxPoint:      utxo.TxPoint,
-			PinId:        pinNode.Id,
-			TickId:       utxo.Mrc20Id,
-			Tick:         utxo.Tick,
-			TxType:       utxo.MrcOption,
-			Direction:    "in", // 收入
-			Address:      utxo.ToAddress,
-			FromAddress:  fromAddress,
-			ToAddress:    utxo.ToAddress,
-			Amount:       utxo.AmtChange,
-			IsChange:     isChange,
-			Chain:        pinNode.ChainName,
-			BlockHeight:  pinNode.GenesisHeight,
-			Timestamp:    pinNode.Timestamp,
-			SpentUtxos:   string(spentJson),
-			CreatedUtxos: string(createdJson),
-			Msg:          utxo.Msg,
-			Status:       utxo.Status,
+	// 4.1 为发送方记录支出流水 (每个 spent UTXO 一条 out 记录)
+	if !skipTransactionRecords {
+		for _, utxo := range spentUtxos {
+			tx := &mrc20.Mrc20Transaction{
+				TxId:         pinNode.GenesisTransaction,
+				TxPoint:      utxo.TxPoint + "_out", // 使用spent UTXO的TxPoint
+				PinId:        pinNode.Id,
+				TickId:       utxo.Mrc20Id,
+				Tick:         utxo.Tick,
+				TxType:       "transfer",
+				Direction:    "out", // 支出
+				Address:      utxo.ToAddress,
+				FromAddress:  utxo.ToAddress,
+				ToAddress:    toAddressForOut, // 显示真正的接收方
+				Amount:       utxo.AmtChange,
+				IsChange:     false,
+				Chain:        pinNode.ChainName,
+				BlockHeight:  pinNode.GenesisHeight,
+				Timestamp:    pinNode.Timestamp,
+				SpentUtxos:   string(spentJson),
+				CreatedUtxos: string(createdJson),
+				Msg:          utxo.Msg,
+				Status:       1,
+			}
+			if err := pd.SaveMrc20Transaction(tx); err != nil {
+				log.Printf("SaveMrc20Transaction (out) error: %v", err)
+				return err
+			}
 		}
-		if err := pd.SaveMrc20Transaction(tx); err != nil {
-			log.Printf("SaveMrc20Transaction (in) error: %v", err)
-			return err
-		}
 
-		// 删除 TransferPendingIn 记录（如果存在，表示 mempool 阶段创建的）
-		if !isChange {
+		// 4.2 为接收方记录收入流水 (每个 created UTXO 一条 in 记录)
+		for _, utxo := range createdUtxos {
+			// 判断是否是找零 (接收方地址 == 发送方地址)
+			isChange := utxo.ToAddress == fromAddress
+
+			tx := &mrc20.Mrc20Transaction{
+				TxId:         pinNode.GenesisTransaction,
+				TxPoint:      utxo.TxPoint,
+				PinId:        pinNode.Id,
+				TickId:       utxo.Mrc20Id,
+				Tick:         utxo.Tick,
+				TxType:       utxo.MrcOption,
+				Direction:    "in", // 收入
+				Address:      utxo.ToAddress,
+				FromAddress:  fromAddress,
+				ToAddress:    utxo.ToAddress,
+				Amount:       utxo.AmtChange,
+				IsChange:     isChange,
+				Chain:        pinNode.ChainName,
+				BlockHeight:  pinNode.GenesisHeight,
+				Timestamp:    pinNode.Timestamp,
+				SpentUtxos:   string(spentJson),
+				CreatedUtxos: string(createdJson),
+				Msg:          utxo.Msg,
+				Status:       1, // 出块确认，状态为成功
+			}
+			if err := pd.SaveMrc20Transaction(tx); err != nil {
+				log.Printf("SaveMrc20Transaction (in) error: %v", err)
+				return err
+			}
+
+			// 删除 TransferPendingIn 记录（出块确认后，所有创建的UTXO都应该删除对应的pending记录）
 			if err := pd.DeleteTransferPendingIn(utxo.TxPoint, utxo.ToAddress); err != nil {
 				// 不阻断主流程，只记录日志
 				log.Printf("DeleteTransferPendingIn warning: %v", err)
 			}
 		}
-	}
+	} // end of if !skipTransactionRecords
 
 	return nil
 }
@@ -996,6 +1228,12 @@ func (pd *PebbleData) SaveMempoolNativeTransferTransaction(
 
 	// 为发送方记录支出流水 (每个 spent UTXO 一条 out 记录)
 	for _, utxo := range spentUtxos {
+		// 对于支出记录，Amount应该是正数
+		amount := utxo.AmtChange
+		if amount.IsNegative() {
+			amount = amount.Abs()
+		}
+
 		tx := &mrc20.Mrc20Transaction{
 			TxId:         txId,
 			TxPoint:      utxo.TxPoint + "_out",
@@ -1007,7 +1245,7 @@ func (pd *PebbleData) SaveMempoolNativeTransferTransaction(
 			Address:      utxo.ToAddress,
 			FromAddress:  utxo.ToAddress,
 			ToAddress:    toAddressForOut,
-			Amount:       utxo.AmtChange,
+			Amount:       amount,
 			IsChange:     false,
 			Chain:        chainName,
 			BlockHeight:  -1, // mempool 阶段标记为 -1
@@ -1046,7 +1284,7 @@ func (pd *PebbleData) SaveMempoolNativeTransferTransaction(
 			SpentUtxos:   string(spentJson),
 			CreatedUtxos: string(createdJson),
 			Msg:          utxo.Msg,
-			Status:       utxo.Status,
+			Status:       1, // mempool阶段，状态为成功
 		}
 		if err := pd.SaveMrc20Transaction(tx); err != nil {
 			log.Printf("SaveMempoolNativeTransferTransaction (in) error: %v", err)
@@ -1120,6 +1358,12 @@ func (pd *PebbleData) SaveMempoolTransferTransaction(
 
 	// 为发送方记录支出流水 (每个 spent UTXO 一条 out 记录)
 	for _, utxo := range spentUtxos {
+		// 对于支出记录，Amount应该是正数
+		amount := utxo.AmtChange
+		if amount.IsNegative() {
+			amount = amount.Abs()
+		}
+
 		tx := &mrc20.Mrc20Transaction{
 			TxId:         pinNode.GenesisTransaction,
 			TxPoint:      utxo.TxPoint + "_out",
@@ -1131,7 +1375,7 @@ func (pd *PebbleData) SaveMempoolTransferTransaction(
 			Address:      utxo.ToAddress,
 			FromAddress:  utxo.ToAddress,
 			ToAddress:    toAddressForOut,
-			Amount:       utxo.AmtChange,
+			Amount:       amount,
 			IsChange:     false,
 			Chain:        pinNode.ChainName,
 			BlockHeight:  -1, // mempool 阶段标记为 -1
@@ -1170,7 +1414,7 @@ func (pd *PebbleData) SaveMempoolTransferTransaction(
 			SpentUtxos:   string(spentJson),
 			CreatedUtxos: string(createdJson),
 			Msg:          utxo.Msg,
-			Status:       utxo.Status,
+			Status:       1, // mempool阶段，状态为成功
 		}
 		if err := pd.SaveMrc20Transaction(tx); err != nil {
 			log.Printf("SaveMempoolTransferTransaction (in) error: %v", err)
@@ -1210,7 +1454,7 @@ func (pd *PebbleData) ProcessNativeTransferSuccess(
 	spentUtxos []*mrc20.Mrc20Utxo,
 	createdUtxos []*mrc20.Mrc20Utxo,
 ) error {
-	log.Printf("[DEBUG] ProcessNativeTransferSuccess: txId=%s, height=%d, spent=%d, created=%d", txId, blockHeight, len(spentUtxos), len(createdUtxos))
+	//log.Printf("[DEBUG] ProcessNativeTransferSuccess: txId=%s, height=%d, spent=%d, created=%d", txId, blockHeight, len(spentUtxos), len(createdUtxos))
 
 	// 获取时间戳
 	var timestamp int64
@@ -1223,7 +1467,7 @@ func (pd *PebbleData) ProcessNativeTransferSuccess(
 
 	// 1. 标记发送方的 spent UTXO 并更新余额
 	for _, utxo := range spentUtxos {
-		log.Printf("[DEBUG] ProcessNativeTransferSuccess: processing spent UTXO %s, addr=%s, amt=%s", utxo.TxPoint, utxo.ToAddress, utxo.AmtChange)
+		//log.Printf("[DEBUG] ProcessNativeTransferSuccess: processing spent UTXO %s, addr=%s, amt=%s", utxo.TxPoint, utxo.ToAddress, utxo.AmtChange)
 		// 标记 UTXO 为已消费（不删除，用于回滚）
 		err := pd.MarkUtxoAsSpent(utxo.TxPoint, utxo.ToAddress, utxo.Mrc20Id, utxo.Chain, blockHeight)
 		if err != nil {
@@ -1242,12 +1486,12 @@ func (pd *PebbleData) ProcessNativeTransferSuccess(
 					Chain:   utxo.Chain,
 				}
 			}
-			log.Printf("[DEBUG] ProcessNativeTransferSuccess: sender %s current balance=%s", utxo.ToAddress, balance.Balance)
+			//log.Printf("[DEBUG] ProcessNativeTransferSuccess: sender %s current balance=%s", utxo.ToAddress, balance.Balance)
 			balanceUpdates[key] = balance
 		}
-		oldBalance := balanceUpdates[key].Balance
+		//oldBalance := balanceUpdates[key].Balance
 		balanceUpdates[key].Balance = balanceUpdates[key].Balance.Sub(utxo.AmtChange)
-		log.Printf("[DEBUG] ProcessNativeTransferSuccess: sender %s balance %s - %s = %s", utxo.ToAddress, oldBalance, utxo.AmtChange, balanceUpdates[key].Balance)
+		//log.Printf("[DEBUG] ProcessNativeTransferSuccess: sender %s balance %s - %s = %s", utxo.ToAddress, oldBalance, utxo.AmtChange, balanceUpdates[key].Balance)
 		balanceUpdates[key].UtxoCount--
 		balanceUpdates[key].LastUpdateTx = txId
 		balanceUpdates[key].LastUpdateHeight = blockHeight
@@ -1257,7 +1501,7 @@ func (pd *PebbleData) ProcessNativeTransferSuccess(
 	// 2. 处理接收方余额 (增加) 并更新 createdUtxos 的 BlockHeight
 	var updatedUtxos []mrc20.Mrc20Utxo
 	for _, utxo := range createdUtxos {
-		log.Printf("[DEBUG] ProcessNativeTransferSuccess: processing created UTXO %s, addr=%s, amt=%s", utxo.TxPoint, utxo.ToAddress, utxo.AmtChange)
+		//log.Printf("[DEBUG] ProcessNativeTransferSuccess: processing created UTXO %s, addr=%s, amt=%s", utxo.TxPoint, utxo.ToAddress, utxo.AmtChange)
 		key := fmt.Sprintf("%s_%s_%s", utxo.Chain, utxo.ToAddress, utxo.Mrc20Id)
 		if _, exists := balanceUpdates[key]; !exists {
 			balance, _ := pd.GetMrc20AccountBalance(utxo.Chain, utxo.ToAddress, utxo.Mrc20Id)
@@ -1269,12 +1513,12 @@ func (pd *PebbleData) ProcessNativeTransferSuccess(
 					Chain:   utxo.Chain,
 				}
 			}
-			log.Printf("[DEBUG] ProcessNativeTransferSuccess: receiver %s current balance=%s", utxo.ToAddress, balance.Balance)
+			//log.Printf("[DEBUG] ProcessNativeTransferSuccess: receiver %s current balance=%s", utxo.ToAddress, balance.Balance)
 			balanceUpdates[key] = balance
 		}
-		oldBalance := balanceUpdates[key].Balance
+		//oldBalance := balanceUpdates[key].Balance
 		balanceUpdates[key].Balance = balanceUpdates[key].Balance.Add(utxo.AmtChange)
-		log.Printf("[DEBUG] ProcessNativeTransferSuccess: receiver %s balance %s + %s = %s", utxo.ToAddress, oldBalance, utxo.AmtChange, balanceUpdates[key].Balance)
+		//log.Printf("[DEBUG] ProcessNativeTransferSuccess: receiver %s balance %s + %s = %s", utxo.ToAddress, oldBalance, utxo.AmtChange, balanceUpdates[key].Balance)
 		balanceUpdates[key].UtxoCount++
 		balanceUpdates[key].LastUpdateTx = txId
 		balanceUpdates[key].LastUpdateHeight = blockHeight
@@ -1335,73 +1579,92 @@ func (pd *PebbleData) ProcessNativeTransferSuccess(
 		toAddressForOut = realRecipients[0] + fmt.Sprintf(" (+%d)", len(realRecipients)-1)
 	}
 
-	// 4.1 为发送方记录支出流水 (每个 spent UTXO 一条 out 记录)
-	for _, utxo := range spentUtxos {
-		tx := &mrc20.Mrc20Transaction{
-			TxId:         txId,
-			TxPoint:      utxo.TxPoint + "_out",
-			PinId:        "",
-			TickId:       utxo.Mrc20Id,
-			Tick:         utxo.Tick,
-			TxType:       "native_transfer",
-			Direction:    "out",
-			Address:      utxo.ToAddress,
-			FromAddress:  utxo.ToAddress,
-			ToAddress:    toAddressForOut, // 显示真正的接收方
-			Amount:       utxo.AmtChange,
-			IsChange:     false,
-			Chain:        chainName,
-			BlockHeight:  blockHeight,
-			Timestamp:    timestamp,
-			SpentUtxos:   string(spentJson),
-			CreatedUtxos: string(createdJson),
-			Msg:          utxo.Msg,
-			Status:       1,
-		}
-		if err := pd.SaveMrc20Transaction(tx); err != nil {
-			log.Printf("SaveMrc20Transaction (out) error: %v", err)
-			return err
+	// 检查是否mempool阶段已创建过Transaction记录
+	skipTransactionRecords := false
+	if len(spentUtxos) > 0 {
+		// 通过tx_txid索引检查是否已有记录
+		testPrefix := []byte(fmt.Sprintf("tx_txid_%s_", txId))
+		iter, err := pd.Database.MrcDb.NewIter(&pebble.IterOptions{
+			LowerBound: testPrefix,
+			UpperBound: append(testPrefix, 0xff),
+		})
+		if err == nil {
+			if iter.First() {
+				// 找到记录，说明mempool阶段已处理
+				skipTransactionRecords = true
+				log.Printf("[DEBUG] ProcessNativeTransferSuccess: mempool记录已存在，跳过Transaction记录创建, tx=%s", txId)
+			}
+			iter.Close()
 		}
 	}
 
-	// 4.2 为接收方记录收入流水 (每个 created UTXO 一条 in 记录)
-	for _, utxo := range createdUtxos {
-		isChange := utxo.ToAddress == fromAddress
-
-		tx := &mrc20.Mrc20Transaction{
-			TxId:         txId,
-			TxPoint:      utxo.TxPoint,
-			PinId:        "",
-			TickId:       utxo.Mrc20Id,
-			Tick:         utxo.Tick,
-			TxType:       "native_transfer",
-			Direction:    "in",
-			Address:      utxo.ToAddress,
-			FromAddress:  fromAddress,
-			ToAddress:    utxo.ToAddress,
-			Amount:       utxo.AmtChange,
-			IsChange:     isChange,
-			Chain:        chainName,
-			BlockHeight:  blockHeight,
-			Timestamp:    timestamp,
-			SpentUtxos:   string(spentJson),
-			CreatedUtxos: string(createdJson),
-			Msg:          utxo.Msg,
-			Status:       utxo.Status,
+	// 4.1 为发送方记录支出流水 (每个 spent UTXO 一条 out 记录)
+	if !skipTransactionRecords {
+		for _, utxo := range spentUtxos {
+			tx := &mrc20.Mrc20Transaction{
+				TxId:         txId,
+				TxPoint:      utxo.TxPoint + "_out",
+				PinId:        "",
+				TickId:       utxo.Mrc20Id,
+				Tick:         utxo.Tick,
+				TxType:       "native_transfer",
+				Direction:    "out",
+				Address:      utxo.ToAddress,
+				FromAddress:  utxo.ToAddress,
+				ToAddress:    toAddressForOut, // 显示真正的接收方
+				Amount:       utxo.AmtChange,
+				IsChange:     false,
+				Chain:        chainName,
+				BlockHeight:  blockHeight,
+				Timestamp:    timestamp,
+				SpentUtxos:   string(spentJson),
+				CreatedUtxos: string(createdJson),
+				Msg:          utxo.Msg,
+				Status:       1,
+			}
+			if err := pd.SaveMrc20Transaction(tx); err != nil {
+				log.Printf("SaveMrc20Transaction (out) error: %v", err)
+				return err
+			}
 		}
-		if err := pd.SaveMrc20Transaction(tx); err != nil {
-			log.Printf("SaveMrc20Transaction (in) error: %v", err)
-			return err
-		}
 
-		// 删除 TransferPendingIn 记录（如果存在，表示 mempool 阶段创建的）
-		if !isChange {
+		// 4.2 为接收方记录收入流水 (每个 created UTXO 一条 in 记录)
+		for _, utxo := range createdUtxos {
+			isChange := utxo.ToAddress == fromAddress
+
+			tx := &mrc20.Mrc20Transaction{
+				TxId:         txId,
+				TxPoint:      utxo.TxPoint,
+				PinId:        "",
+				TickId:       utxo.Mrc20Id,
+				Tick:         utxo.Tick,
+				TxType:       "native_transfer",
+				Direction:    "in",
+				Address:      utxo.ToAddress,
+				FromAddress:  fromAddress,
+				ToAddress:    utxo.ToAddress,
+				Amount:       utxo.AmtChange,
+				IsChange:     isChange,
+				Chain:        chainName,
+				BlockHeight:  blockHeight,
+				Timestamp:    timestamp,
+				SpentUtxos:   string(spentJson),
+				CreatedUtxos: string(createdJson),
+				Msg:          utxo.Msg,
+				Status:       1, // block阶段，状态为成功
+			}
+			if err := pd.SaveMrc20Transaction(tx); err != nil {
+				log.Printf("SaveMrc20Transaction (in) error: %v", err)
+				return err
+			}
+
+			// 删除 TransferPendingIn 记录（出块确认后，所有创建的UTXO都应该删除对应的pending记录）
 			if err := pd.DeleteTransferPendingIn(utxo.TxPoint, utxo.ToAddress); err != nil {
 				// 不阻断主流程，只记录日志
 				log.Printf("DeleteTransferPendingIn warning: %v", err)
 			}
 		}
-	}
+	} // end of if !skipTransactionRecords
 
 	return nil
 }
