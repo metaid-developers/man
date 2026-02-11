@@ -1047,69 +1047,59 @@ type Mrc20Holder struct {
 	Balance decimal.Decimal `json:"balance"`
 }
 
-// GetMrc20Holders 获取 tick 的持有者列表（包括曾经持有过的）
-// 使用 mrc20_in_ 前缀，显示所有曾经持有过代币的地址
+// GetMrc20Holders 获取 tick 的持有者列表（复用 API 余额接口）
 func (pd *PebbleData) GetMrc20Holders(tickId string, start, limit int, searchAddress string) ([]Mrc20Holder, error) {
-	// 遍历所有地址的 UTXO，找出 mrc20Id 匹配的记录
-	balanceMap := make(map[string]decimal.Decimal) // 当前可用余额
-	addressSet := make(map[string]bool)            // 所有曾经持有过的地址
+	// 收集所有持有该 tickId 的地址
+	addressSet := make(map[string]bool)
 
-	// 遍历 mrc20_in_ 前缀的所有数据
-	prefix := "mrc20_in_"
+	// 扫描 UTXO 收集地址
+	prefix := []byte("mrc20_utxo_")
 	iter, err := pd.Database.MrcDb.NewIter(&pebble.IterOptions{
-		LowerBound: []byte(prefix),
-		UpperBound: []byte(prefix + "~"),
+		LowerBound: prefix,
+		UpperBound: append(prefix, 0xff),
 	})
 	if err != nil {
-		//log.Printf("[MRC20] GetMrc20Holders: NewIter error: %v", err)
 		return nil, err
 	}
 	defer iter.Close()
 
-	totalCount := 0
-	matchCount := 0
 	for iter.First(); iter.Valid(); iter.Next() {
-		totalCount++
 		var utxo mrc20.Mrc20Utxo
-		err := sonic.Unmarshal(iter.Value(), &utxo)
-		if err != nil {
+		if err := sonic.Unmarshal(iter.Value(), &utxo); err != nil {
 			continue
 		}
 
-		// 只统计匹配 tickId 的记录
-		if utxo.Mrc20Id != tickId {
-			continue
-		}
-
-		if utxo.ToAddress == "" {
-			continue
-		}
-
-		// 如果有搜索条件，只统计匹配的地址
-		if searchAddress != "" && !strings.Contains(utxo.ToAddress, searchAddress) {
-			continue
-		}
-
-		matchCount++
-		// 记录所有曾经持有过的地址
-		addressSet[utxo.ToAddress] = true
-		// 只有 Status=0 的才计入可用余额
-		if utxo.Status == mrc20.UtxoStatusAvailable {
-			balanceMap[utxo.ToAddress] = balanceMap[utxo.ToAddress].Add(utxo.AmtChange)
+		if utxo.Mrc20Id == tickId && utxo.ToAddress != "" {
+			if searchAddress == "" || strings.Contains(utxo.ToAddress, searchAddress) {
+				addressSet[utxo.ToAddress] = true
+			}
 		}
 	}
-	//log.Printf("[MRC20] GetMrc20Holders: tickId=%s, totalUtxos=%d, matchedUtxos=%d, uniqueAddresses=%d", tickId, totalCount, matchCount, len(addressSet))
 
-	// 转换为列表（包括余额为0的曾持有者）
+	// 使用 API 余额接口计算每个地址的余额（自动处理跨链）
 	var holders []Mrc20Holder
 	for addr := range addressSet {
-		balance := balanceMap[addr] // 如果没有可用余额，默认为0
-		if balance.LessThan(decimal.Zero) {
-			balance = decimal.Zero // 不显示负数余额
+		// 调用和 API 相同的方法：GetAllChainsBalances
+		allBalances, err := GetAllChainsBalances(addr)
+		if err != nil {
+			log.Printf("[Holders] Failed to get balances for addr=%s: %v", addr, err)
+			continue
 		}
+
+		// 累加该地址在所有链上该 tickId 的余额
+		totalBalance := decimal.Zero
+		for _, balances := range allBalances {
+			for _, b := range balances {
+				if b.TickId == tickId {
+					// 使用 Balance 字段（和 API 返回的一致）
+					totalBalance = totalBalance.Add(b.Balance)
+				}
+			}
+		}
+
 		holders = append(holders, Mrc20Holder{
 			Address: addr,
-			Balance: balance,
+			Balance: totalBalance,
 		})
 	}
 
@@ -1432,14 +1422,12 @@ func (pd *PebbleData) GetMrc20UtxoByTxPoint(txPoint string, checkStatus bool) (*
 
 // SavePendingTeleport 保存等待 arrival 的 teleport transfer
 func (pd *PebbleData) SavePendingTeleport(pending *mrc20.PendingTeleport) error {
-	data, err := sonic.Marshal(pending)
-	if err != nil {
-		return fmt.Errorf("marshal pending teleport error: %w", err)
-	}
+	_ = pending // V1 deprecated
+	// V1 PendingTeleport structure - deprecated in V2
+	// V2 uses new structure stored via man/mrc20_teleport_storage.go
+	return fmt.Errorf("SavePendingTeleport (V1) is deprecated, use V2 storage")
 
-	batch := pd.Database.MrcDb.NewBatch()
-	defer batch.Close()
-
+	/* V1 implementation
 	// 主键: pending_teleport_{pinId}
 	key := fmt.Sprintf("pending_teleport_%s", pending.PinId)
 	err = batch.Set([]byte(key), data, pebble.Sync)
@@ -1455,6 +1443,7 @@ func (pd *PebbleData) SavePendingTeleport(pending *mrc20.PendingTeleport) error 
 	}
 
 	return batch.Commit(pebble.Sync)
+	*/
 }
 
 // GetPendingTeleportByCoord 根据 coord (期望的 arrival pinId) 获取等待的 teleport

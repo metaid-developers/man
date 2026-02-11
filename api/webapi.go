@@ -405,7 +405,7 @@ type txMsgInput struct {
 func tx(ctx *gin.Context) {
 	txid := ctx.Param("txid")
 	chain := ctx.Param("chain")
-	if chain != "btc" && chain != "mvc" {
+	if chain != "btc" && chain != "mvc" && chain != "doge" {
 		ctx.String(200, "fail")
 		return
 	}
@@ -425,7 +425,7 @@ func tx(ctx *gin.Context) {
 	for _, in := range tx.MsgTx().TxIn {
 		point := in.PreviousOutPoint
 		witness := [][]string{}
-		if chain == "btc" && tx.MsgTx().HasWitness() {
+		if (chain == "btc" || chain == "doge") && tx.MsgTx().HasWitness() {
 			//for _, in := range tx.MsgTx().TxIn {
 			if len(in.Witness) > 0 {
 				w, err := common.BtcParseWitnessScript(in.Witness)

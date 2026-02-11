@@ -733,16 +733,11 @@ func (pd *PebbleData) ReindexFromHeight(chain string, targetHeight int64) (stats
 			if err := sonic.Unmarshal(pendingTeleportIter.Value(), &pending); err != nil {
 				continue
 			}
-			// 如果与当前链相关（源链或目标链），且 BlockHeight >= targetHeight 或 status=0（未完成）
-			if (pending.SourceChain == chain || pending.TargetChain == chain) &&
-				(pending.BlockHeight >= targetHeight || pending.Status == 0) {
-				// 删除主记录
-				pd.Database.MrcDb.Delete(pendingTeleportIter.Key(), pebble.Sync)
-				// 删除 coord 索引
-				coordKey := fmt.Sprintf("pending_teleport_coord_%s", pending.Coord)
-				pd.Database.MrcDb.Delete([]byte(coordKey), pebble.Sync)
-				pendingTeleportCleared++
-			}
+			// V1 PendingTeleport structure - deprecated
+			// V2 doesn't store BlockHeight or Status in the same way
+			// Skip cleanup of V1 pending teleports during reindex
+			// They will be cleaned up by CleanExpiredPendingTeleports()
+			log.Printf("[Reindex] Skipping V1 PendingTeleport cleanup: coord=%s (use V2 cleanup)", pending.Coord)
 		}
 		pendingTeleportIter.Close()
 	}
@@ -930,8 +925,6 @@ func (pd *PebbleData) VerifyBalance(chain, address, tickId string) (bool, error)
 // 在启动时调用，检查 pending 状态的 UTXO 对应的交易是否已经确认
 // 如果已确认，将输入 UTXO 的状态更新为 Spent
 func (pd *PebbleData) FixPendingUtxoStatus(chainName string) (int, error) {
-	log.Printf("[MRC20] FixPendingUtxoStatus: scanning pending UTXOs for chain %s", chainName)
-
 	fixedCount := 0
 
 	// 收集所有 pending 状态的 UTXO 和它们的 OperationTx
@@ -973,9 +966,6 @@ func (pd *PebbleData) FixPendingUtxoStatus(chainName string) (int, error) {
 		pendingUtxos[utxo.TxPoint] = &utxo
 		operationTxMap[utxo.OperationTx] = append(operationTxMap[utxo.OperationTx], utxo.TxPoint)
 	}
-
-	log.Printf("[MRC20] FixPendingUtxoStatus: found %d pending UTXOs in %d transactions",
-		len(pendingUtxos), len(operationTxMap))
 
 	// 对于每个 OperationTx，检查其输出 UTXO 是否已确认
 	for operationTx, inputTxPoints := range operationTxMap {
@@ -1031,6 +1021,5 @@ func (pd *PebbleData) FixPendingUtxoStatus(chainName string) (int, error) {
 		}
 	}
 
-	log.Printf("[MRC20] FixPendingUtxoStatus: fixed %d pending UTXOs", fixedCount)
 	return fixedCount, nil
 }

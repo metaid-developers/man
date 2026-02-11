@@ -168,6 +168,8 @@ func (pd *PebbleData) SaveMrc20Transaction(tx *mrc20.Mrc20Transaction) error {
 	if tx.Address != "" {
 		addrKey := []byte(fmt.Sprintf("tx_addr_%s_%s_%s_%012d_%s", tx.Address, tx.TickId, blockHeightStr, tx.Timestamp, txPointForKey))
 		batch.Set(addrKey, key, pebble.Sync)
+	} else {
+		log.Printf("[SaveTx] ⚠️  Address empty! TxType=%s, Direction=%s, From=%s, To=%s", tx.TxType, tx.Direction, tx.FromAddress, tx.ToAddress)
 	}
 
 	// 按 TxId 索引: tx_txid_{txId}_{txPoint}（用于UpdateMrc20TransactionBlockHeight查找所有相关记录）

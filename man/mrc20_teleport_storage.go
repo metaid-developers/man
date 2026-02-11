@@ -2,7 +2,9 @@ package man
 
 import (
 	"fmt"
+	"log"
 	"manindexer/mrc20"
+	"manindexer/pin"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -173,6 +175,159 @@ func RetryStuckTeleports() error {
 
 		tx.ReleaseLock(ProcessID)
 		SaveTeleportTransaction(tx)
+	}
+
+	return nil
+}
+
+// ============ PendingTeleport Storage ============
+
+// SavePendingTeleport 保存等待配对的 Teleport
+func SavePendingTeleport(pending *mrc20.PendingTeleport) error {
+	if pending == nil {
+		return fmt.Errorf("pending is nil")
+	}
+
+	data, err := sonic.Marshal(pending)
+	if err != nil {
+		return fmt.Errorf("marshal failed: %w", err)
+	}
+
+	key := fmt.Sprintf("pending_teleport_%s", pending.Coord)
+	err = PebbleStore.Database.MrcDb.Set([]byte(key), data, pebble.Sync)
+	if err != nil {
+		return fmt.Errorf("save pending teleport failed: %w", err)
+	}
+
+	return nil
+}
+
+// GetPendingTeleport 获取等待配对的 Teleport
+func GetPendingTeleport(coord string) (*mrc20.PendingTeleport, error) {
+	key := fmt.Sprintf("pending_teleport_%s", coord)
+	value, closer, err := PebbleStore.Database.MrcDb.Get([]byte(key))
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+
+	var pending mrc20.PendingTeleport
+	if err := sonic.Unmarshal(value, &pending); err != nil {
+		return nil, fmt.Errorf("unmarshal failed: %w", err)
+	}
+
+	return &pending, nil
+}
+
+// DeletePendingTeleport 删除等待配对的 Teleport
+func DeletePendingTeleport(coord string) error {
+	key := fmt.Sprintf("pending_teleport_%s", coord)
+	return PebbleStore.Database.MrcDb.Delete([]byte(key), pebble.Sync)
+}
+
+// ListAllPendingTeleports 列出所有等待配对的 Teleport
+func ListAllPendingTeleports() ([]*mrc20.PendingTeleport, error) {
+	prefix := []byte("pending_teleport_")
+	iter, err := PebbleStore.Database.MrcDb.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: append(prefix, 0xff),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	var result []*mrc20.PendingTeleport
+	for iter.First(); iter.Valid(); iter.Next() {
+		var pending mrc20.PendingTeleport
+		if err := sonic.Unmarshal(iter.Value(), &pending); err != nil {
+			continue
+		}
+		result = append(result, &pending)
+	}
+
+	return result, nil
+}
+
+// CleanExpiredPendingTeleports 清理过期的 Pending Teleport
+func CleanExpiredPendingTeleports() error {
+	allPending, err := ListAllPendingTeleports()
+	if err != nil {
+		return err
+	}
+
+	now := time.Now().Unix()
+	for _, pending := range allPending {
+		if pending.ExpireAt > 0 && now > pending.ExpireAt {
+			DeletePendingTeleport(pending.Coord)
+		}
+	}
+
+	return nil
+}
+
+// RetryPendingTeleports 定期扫描并重试 Pending Teleport（兜底机制）
+// 检查是否有等待的transfer可以与已到达的arrival配对
+func RetryPendingTeleports() error {
+	allPending, err := ListAllPendingTeleports()
+	if err != nil {
+		return err
+	}
+
+	for _, pending := range allPending {
+		// 检查重试间隔（避免频繁重试）
+		now := time.Now().Unix()
+		if pending.LastCheckAt > 0 && now-pending.LastCheckAt < 60 {
+			// 60秒内已检查过，跳过
+			continue
+		}
+
+		// 检查是否已过期
+		if pending.ExpireAt > 0 && now > pending.ExpireAt {
+			log.Printf("[RetryPending] ⏰ Expired: coord=%s, deleting...", pending.Coord)
+			DeletePendingTeleport(pending.Coord)
+			continue
+		}
+
+		// 只处理transfer类型（arrival类型暂不需要重试）
+		if pending.Type != "transfer" {
+			continue
+		}
+
+		// 检查对应的arrival是否已到达
+		arrival, err := PebbleStore.GetMrc20ArrivalByPinId(pending.Coord)
+		if err != nil {
+			// Arrival还未到达，继续等待
+			continue
+		}
+		_ = arrival // Suppress unused variable warning
+
+		log.Printf("[RetryPending] ✅ Found arrival for pending transfer: coord=%s, retrying...", pending.Coord)
+
+		// 反序列化pinNode
+		var pinNode pin.PinInscription
+		err = sonic.Unmarshal([]byte(pending.PinNodeJson), &pinNode)
+		if err != nil {
+			log.Printf("[RetryPending] ❌ Failed to unmarshal pinNode: %v", err)
+			DeletePendingTeleport(pending.Coord)
+			continue
+		}
+
+		// 重新触发处理
+		isMempool := pinNode.GenesisHeight <= 0
+		err = ProcessTeleportV2(&pinNode, pending.Data, isMempool)
+		if err != nil {
+			log.Printf("[RetryPending] ⚠️  Retry failed: %v, will retry later", err)
+			// 更新重试计数
+			pending.RetryCount++
+			pending.LastCheckAt = now
+			SavePendingTeleport(pending)
+			continue
+		}
+
+		// 成功，删除pending记录
+		DeletePendingTeleport(pending.Coord)
+		log.Printf("[RetryPending] ✅ Successfully processed: coord=%s", pending.Coord)
 	}
 
 	return nil

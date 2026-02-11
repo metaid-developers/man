@@ -259,25 +259,6 @@ type Mrc20Teleport struct {
 	Timestamp      int64           `json:"timestamp"`      // 时间戳
 }
 
-// PendingTeleport 表示等待 arrival 的 teleport transfer
-// 当 transfer 先于 arrival 出块时，存入此队列等待匹配
-type PendingTeleport struct {
-	PinId         string `json:"pinId"`         // transfer PIN ID
-	TxId          string `json:"txId"`          // transfer 交易 ID
-	Coord         string `json:"coord"`         // 期望的 arrival PIN ID
-	TickId        string `json:"tickId"`        // MRC20 ID
-	Amount        string `json:"amount"`        // 跃迁金额
-	AssetOutpoint string `json:"assetOutpoint"` // 待跃迁的 UTXO txpoint
-	TargetChain   string `json:"targetChain"`   // 目标链
-	FromAddress   string `json:"fromAddress"`   // 发送者地址
-	SourceChain   string `json:"sourceChain"`   // 源链
-	BlockHeight   int64  `json:"blockHeight"`   // 区块高度
-	Timestamp     int64  `json:"timestamp"`     // 时间戳
-	RetryCount    int    `json:"retryCount"`    // 重试次数
-	Status        int    `json:"status"`        // 状态: 0=pending, 1=completed, -1=invalid
-	RawContent    []byte `json:"rawContent"`    // 原始 PIN 内容
-}
-
 // TeleportPendingIn 表示 teleport 接收方的待转入余额记录
 // 当 arrival 和 teleport transfer 都在 mempool/出块后，但跃迁未最终完成时创建
 type TeleportPendingIn struct {

@@ -9,11 +9,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	bsvwire "github.com/bitcoinsv/bsvd/wire"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/txscript"
 	btcwire "github.com/btcsuite/btcd/wire"
+	"github.com/bytedance/sonic"
 	"github.com/shopspring/decimal"
 )
 
@@ -197,6 +199,10 @@ func Mrc20Handle(chainName string, height int64, mrc20List []*pin.PinInscription
 			if err := RetryStuckTeleports(); err != nil {
 				log.Printf("[TeleportV2] ⚠️  Retry failed: %v", err)
 			}
+			// 重试等待配对的 Pending Teleport（双向等待机制的兜底）
+			if err := RetryPendingTeleports(); err != nil {
+				log.Printf("[PendingPair] ⚠️  Retry pending failed: %v", err)
+			}
 		} else {
 			// V1架构重试
 			retryPendingTeleports()
@@ -217,7 +223,10 @@ func Mrc20Handle(chainName string, height int64, mrc20List []*pin.PinInscription
 // 检查双方是否都已确认，如果是则执行 teleport
 // DiagnosePendingTeleport 诊断并尝试修复指定的pending teleport
 // 返回：是否成功修复，错误信息
+// 注意：这是V1 teleport的逻辑，V2架构使用新的双向等待机制
 func DiagnosePendingTeleport(coord string) (bool, string) {
+	return false, "V1 DiagnosePendingTeleport is deprecated, use V2 teleport architecture"
+	/* V1 Logic - Commented out
 	// 查找PendingTeleport
 	pending, err := PebbleStore.GetPendingTeleportByCoord(coord)
 	if err != nil || pending == nil {
@@ -286,9 +295,14 @@ func DiagnosePendingTeleport(coord string) (bool, string) {
 	}
 
 	return false, "Teleport execution may have failed, check logs for details"
+	*/
 }
 
 func retryPendingTeleports() {
+	// V1 teleport 重试逻辑（已废弃）
+	// V2架构使用RetryPendingTeleports和RetryStuckTeleports
+	log.Printf("[TeleportV1] retryPendingTeleports is deprecated, use V2 architecture")
+	/* V1 Logic - Commented out
 	pendingList, err := PebbleStore.GetAllPendingTeleports()
 	if err != nil || len(pendingList) == 0 {
 		return
@@ -330,6 +344,7 @@ func retryPendingTeleports() {
 
 		processPendingTeleportForArrival(arrival)
 	}
+	*/
 }
 
 func handleNativTransfer(chainName string, height int64, mrc20TransferPinTx map[string]struct{}, txInList []string, isMempool bool) {
@@ -490,8 +505,6 @@ func transferHandleWithMempool(transferHandleList []*pin.PinInscription, isMempo
 			normalTransferList = append(normalTransferList, pinNode)
 		}
 	}
-
-	log.Printf("[DEBUG] transferHandleWithMempool: total=%d, normal=%d, teleport=%d, isMempool=%v", len(transferHandleList), len(normalTransferList), len(teleportTransferList), isMempool)
 
 	// 第一步：处理所有普通 transfer，创建输出 UTXO
 	// 使用循环重试机制处理依赖关系（同一区块内普通 transfer 之间的依赖）
@@ -1252,11 +1265,47 @@ func arrivalHandle(pinNode *pin.PinInscription) error {
 	existingArrival, _ := PebbleStore.GetMrc20ArrivalByAssetOutpoint(data.AssetOutpoint)
 	if existingArrival != nil {
 		// 如果已存在 arrival 且当前是区块确认（非 mempool），可能是 mempool→确认 的过渡
-		if pinNode.GenesisHeight > 0 && existingArrival.Status == mrc20.ArrivalStatusPending {
+		// 🔧 修复：也处理 Invalid 状态（mempool 时可能因无法解析 ToAddress 而失败）
+		if pinNode.GenesisHeight > 0 && (existingArrival.Status == mrc20.ArrivalStatusPending || existingArrival.Status == mrc20.ArrivalStatusInvalid) {
 			// 更新区块高度并重新处理（从 mempool 变为确认）
-			log.Printf("[Arrival] Existing arrival %s transitioning from mempool to block %d", existingArrival.PinId, pinNode.GenesisHeight)
+			log.Printf("[Arrival] Existing arrival %s transitioning from mempool to block %d (status=%d)", existingArrival.PinId, pinNode.GenesisHeight, existingArrival.Status)
+
+			// 检查是否已存在源链 UTXO 和 tick 信息（用于后续验证）
+			var tickName string
+			sourceUtxo, _ := PebbleStore.GetMrc20UtxoByTxPoint(data.AssetOutpoint, false)
+			if sourceUtxo != nil {
+				tickName = sourceUtxo.Tick
+				// 验证 tickId 匹配
+				if sourceUtxo.Mrc20Id != data.TickId {
+					log.Printf("[Arrival] ❌ TickId mismatch: expected %s, got %s", sourceUtxo.Mrc20Id, data.TickId)
+					return saveInvalidArrival(pinNode, fmt.Sprintf("tickId mismatch: expected %s, got %s", sourceUtxo.Mrc20Id, data.TickId))
+				}
+			} else {
+				tickInfo, tickErr := PebbleStore.GetMrc20TickInfo(data.TickId, "")
+				if tickErr == nil {
+					tickName = tickInfo.Tick
+				}
+			}
+
+			// 更新 arrival 信息（从 Invalid → Pending 或保持 Pending）
 			existingArrival.BlockHeight = pinNode.GenesisHeight
 			existingArrival.Timestamp = pinNode.Timestamp
+			existingArrival.Status = mrc20.ArrivalStatusPending // 重置为 Pending
+			existingArrival.Tick = tickName
+			existingArrival.TickId = data.TickId
+			existingArrival.LocationIndex = data.LocationIndex
+
+			// 🔧 修复：重新解析 ToAddress（mempool 时可能为空或解析失败）
+			if existingArrival.ToAddress == "" || existingArrival.Status == mrc20.ArrivalStatusInvalid {
+				log.Printf("[Arrival] 🔍 Re-parsing ToAddress for arrival %s (was empty or invalid in mempool)", existingArrival.PinId)
+				if toAddress != "" {
+					existingArrival.ToAddress = toAddress
+					log.Printf("[Arrival] ✅ Updated ToAddress: %s", toAddress)
+				} else {
+					log.Printf("[Arrival] ⚠️  ToAddress still empty after re-parsing")
+				}
+			}
+
 			PebbleStore.SaveMrc20Arrival(existingArrival)
 			// 重新处理 pending teleport（现在会执行完整 teleport）
 			processPendingTeleportForArrival(existingArrival)
@@ -1332,11 +1381,28 @@ func arrivalHandle(pinNode *pin.PinInscription) error {
 	// 检查是否有等待此 arrival 的 pending teleport
 	processPendingTeleportForArrival(arrival)
 
+	// ✅ V2 架构：processPendingTeleportForArrival 会处理所有逻辑（包括流水记录）
+	// 直接返回，不再执行后面的 V1 旧代码
 	return nil
 }
 
-// saveTeleportPendingIn 保存 teleport 接收方的 pending 余额记录
+// ========== 以下是旧的 V1 Teleport 逻辑，已被 V2 替代，保留仅用于向后兼容 ==========
+
+// executeTeleportTransfer 实际执行 teleport 转账 (V1 Legacy, deprecated in V2)
+// 此函数在 arrival 已存在且验证通过的情况下调用
+func executeTeleportTransferV1_Deprecated(pinNode *pin.PinInscription, data mrc20.Mrc20TeleportTransferData, sourceUtxo *mrc20.Mrc20Utxo, arrival *mrc20.Mrc20Arrival, isMempool bool) ([]*mrc20.Mrc20Utxo, error) {
+	// V1 Logic - This code is no longer executed in V2 architecture
+	// Kept for reference only, all teleport processing now handled by V2 state machine
+	log.Printf("[TeleportV1] ⚠️  executeTeleportTransferV1_Deprecated called (should not happen in V2)")
+	return nil, fmt.Errorf("V1 teleport logic deprecated, use V2 ProcessTeleportV2")
+}
+
+// 注意：这是V1 teleport的逻辑，V2架构使用不同的机制
+// 保留此函数以保持兼容性，但V2不再使用
 func saveTeleportPendingIn(arrival *mrc20.Mrc20Arrival, pending *mrc20.PendingTeleport) {
+	// V1 Legacy code - V2 uses different mechanism
+	log.Printf("[TeleportV1] saveTeleportPendingIn called (deprecated in V2)")
+	/* V1 Implementation - Commented out
 	amount, _ := decimal.NewFromString(pending.Amount)
 	pendingIn := &mrc20.TeleportPendingIn{
 		Coord:       arrival.PinId,
@@ -1377,6 +1443,7 @@ func saveTeleportPendingIn(arrival *mrc20.Mrc20Arrival, pending *mrc20.PendingTe
 	if err != nil {
 		log.Printf("[ERROR] UpdateMrc20AccountBalance failed for PendingIn: %v", err)
 	}
+	*/
 }
 
 // processPendingTeleportForArrival 处理等待特定 arrival 的 pending teleport
@@ -1385,123 +1452,65 @@ func saveTeleportPendingIn(arrival *mrc20.Mrc20Arrival, pending *mrc20.PendingTe
 // - mempool 时只保存 TeleportPendingIn（接收方 PendingIn += amount），不执行 teleport
 // - 区块确认时才执行完整的 teleport
 func processPendingTeleportForArrival(arrival *mrc20.Mrc20Arrival) {
-	log.Printf("[processPendingTeleportForArrival] 🔍 Checking for pending teleport: arrivalPinId=%s, assetOutpoint=%s, blockHeight=%d",
-		arrival.PinId, arrival.AssetOutpoint, arrival.BlockHeight)
+	log.Printf("[PendingPair] 🔍 双向检查: Arrival已到达, 检查是否有等待的Transfer (coord=%s)", arrival.PinId)
 
-	pending, err := PebbleStore.GetPendingTeleportByCoord(arrival.PinId)
+	// 从新的PendingTeleport存储中查找
+	pending, err := GetPendingTeleport(arrival.PinId)
 	if err != nil {
-		// 没有等待的 teleport，正常情况
-		log.Printf("[processPendingTeleportForArrival] ℹ️ No pending teleport found for arrival %s", arrival.PinId)
-		log.Printf("[processPendingTeleportForArrival] ⏳ Arrival is now waiting for corresponding teleport transfer to arrive")
+		// 没有等待的 teleport，arrival 等待 transfer 到达
+		log.Printf("[PendingPair] ℹ️  No pending transfer found, arrival is waiting for transfer to arrive")
 		return
 	}
 
-	log.Printf("[processPendingTeleportForArrival] ✅ Found pending teleport: pinId=%s, coord=%s, blockHeight=%d",
-		pending.PinId, pending.Coord, pending.BlockHeight)
+	log.Printf("[PendingPair] ✅ Found pending transfer! type=%s, sourceTx=%s, createdAt=%d",
+		pending.Type, pending.SourceTxId, pending.CreatedAt)
 
-	isMempool := arrival.BlockHeight == -1
-	log.Printf("[processPendingTeleportForArrival] 🔗 Processing teleport-arrival pair: teleportTx=%s, arrivalTx=%s, isMempool=%v",
-		pending.TxId, arrival.TxId, isMempool)
-	log.Printf("Found pending teleport %s waiting for arrival %s (isMempool=%v), processing...", pending.PinId, arrival.PinId, isMempool)
-
-	// 验证 pending teleport 的 assetOutpoint 与 arrival 声明的一致
-	if pending.AssetOutpoint != arrival.AssetOutpoint {
-		log.Printf("AssetOutpoint mismatch: pending has %s, arrival expects %s", pending.AssetOutpoint, arrival.AssetOutpoint)
-		// 更新 pending 状态为 invalid
-		pending.Status = -1
-		PebbleStore.SavePendingTeleport(pending)
-		// 更新 arrival 状态为 invalid
-		PebbleStore.UpdateMrc20ArrivalStatus(arrival.PinId, mrc20.ArrivalStatusInvalid, "", "", "", 0)
+	// 验证是Transfer类型（Type="transfer"表示transfer先到达）
+	if pending.Type != "transfer" {
+		log.Printf("[PendingPair] ⚠️  Unexpected pending type: %s, skipping", pending.Type)
 		return
 	}
 
-	// 检查是否已经保存过 TeleportPendingIn（mempool 时已保存）
-	existingPendingIn, _ := PebbleStore.GetTeleportPendingInByCoord(arrival.PinId)
-
-	if isMempool {
-		// 【mempool 阶段】只保存 TeleportPendingIn，不执行 teleport
-		if existingPendingIn == nil {
-			saveTeleportPendingIn(arrival, pending)
-			log.Printf("[Teleport Mempool] Saved PendingIn for receiver, waiting for block confirmation")
-		}
-		return
-	}
-
-	// 【区块确认阶段】执行完整的 teleport
-	// 如果 mempool 阶段没有保存 PendingIn，先保存
-	if existingPendingIn == nil {
-		saveTeleportPendingIn(arrival, pending)
-	}
-
-	// 获取 UTXO 并验证状态
-	sourceUtxo, err := PebbleStore.GetMrc20UtxoByTxPoint(pending.AssetOutpoint, false)
+	// 反序列化pinNode
+	var pinNode pin.PinInscription
+	err = sonic.Unmarshal([]byte(pending.PinNodeJson), &pinNode)
 	if err != nil {
-		log.Printf("Source UTXO not found: %s", pending.AssetOutpoint)
-		pending.Status = -1
-		PebbleStore.SavePendingTeleport(pending)
+		log.Printf("[PendingPair] ❌ Failed to unmarshal pinNode: %v", err)
+		DeletePendingTeleport(pending.Coord)
 		return
 	}
 
-	// 检查 UTXO 状态
-	if sourceUtxo.Status == mrc20.UtxoStatusSpent {
-		// UTXO 已被消耗（在 pending 期间被其他交易花费了）
-		log.Printf("UTXO %s was spent during pending state, teleport failed", pending.AssetOutpoint)
-		pending.Status = -1
-		PebbleStore.SavePendingTeleport(pending)
-		PebbleStore.UpdateMrc20ArrivalStatus(arrival.PinId, mrc20.ArrivalStatusInvalid, "", "", "", 0)
-		return
-	}
-
-	// 构造 teleport 数据
-	teleportData := mrc20.Mrc20TeleportTransferData{
-		Id:     pending.TickId,
-		Amount: pending.Amount,
-		Coord:  pending.Coord,
-		Chain:  pending.TargetChain,
-		Type:   "teleport",
-	}
-
-	// 构造 pinNode 用于处理
-	// 注意：使用 arrival 的区块高度，因为这是 teleport 完成确认的时间
-	// pending.BlockHeight 可能是 -1 (mempool 阶段创建的)
-	teleportBlockHeight := pending.BlockHeight
-	teleportTimestamp := pending.Timestamp
-	if arrival.BlockHeight > 0 {
-		// 如果 arrival 已确认，使用 arrival 的区块高度作为 teleport 完成高度
-		teleportBlockHeight = arrival.BlockHeight
-		teleportTimestamp = arrival.Timestamp
-	}
-
-	fakePinNode := &pin.PinInscription{
-		Id:                 pending.PinId,
-		GenesisTransaction: pending.TxId,
-		Address:            pending.FromAddress,
-		ChainName:          pending.SourceChain,
-		GenesisHeight:      teleportBlockHeight,
-		Timestamp:          teleportTimestamp,
-		ContentBody:        pending.RawContent,
-	}
-
-	// 执行跃迁
-	utxoList, err := executeTeleportTransfer(fakePinNode, teleportData, sourceUtxo, arrival, false)
+	// ⚠️ 重要：重新从数据库加载最新的 pinNode
+	// 因为缓存的 pinNode 可能是 mempool 阶段保存的（GenesisHeight=-1）
+	// 现在 transfer 可能已经出块了，需要使用最新的高度信息
+	latestPinNode, err := PebbleStore.GetPinById(pinNode.Id)
 	if err != nil {
-		log.Printf("Execute pending teleport error: %v", err)
+		log.Printf("[PendingPair] ⚠️  Failed to reload pinNode from DB: %v, using cached version", err)
+		latestPinNode = pinNode // 降级：使用缓存的版本
+	} else {
+		log.Printf("[PendingPair] 🔄 Reloaded pinNode: pinId=%s, height changed from %d to %d",
+			pinNode.Id, pinNode.GenesisHeight, latestPinNode.GenesisHeight)
+	}
+
+	// 重新触发teleport处理（此时arrival已存在）
+	log.Printf("[PendingPair] 🔄 Retriggering teleport processing: pinId=%s, coord=%s", latestPinNode.Id, pending.Coord)
+
+	// 调用V2处理逻辑
+	isMempool := latestPinNode.GenesisHeight <= 0
+	err = ProcessTeleportV2(&latestPinNode, pending.Data, isMempool)
+	if err != nil {
+		log.Printf("[PendingPair] ⚠️  Retry failed: %v, will retry later", err)
+		// 更新重试计数
 		pending.RetryCount++
-		pending.Status = -1
-		PebbleStore.SavePendingTeleport(pending)
+		pending.LastCheckAt = time.Now().Unix()
+		SavePendingTeleport(pending)
 		return
 	}
 
-	// 处理成功，保存 UTXO
-	if len(utxoList) > 0 {
-		PebbleStore.UpdateMrc20Utxo(utxoList, false)
-	}
-
-	// 更新 pending 状态为完成
-	pending.Status = 1
-	PebbleStore.SavePendingTeleport(pending)
-
-	log.Printf("Pending teleport %s processed successfully (block confirmed)", pending.PinId)
+	// 处理成功，删除pending记录
+	DeletePendingTeleport(pending.Coord)
+	log.Printf("[PendingPair] ✅ Successfully paired and processed: transfer=%s + arrival=%s",
+		pending.SourceTxId, arrival.TxId)
 }
 
 // saveCompletedArrival 保存已完成的 arrival 记录
@@ -1743,316 +1752,10 @@ func processTeleportTransfer(pinNode *pin.PinInscription, isMempool bool) (bool,
 // 2. 验证 UTXO 状态必须是可用(0)
 // 3. 如果 arrival 存在且 pending → 执行跃迁
 // 4. 如果 arrival 不存在 → UTXO 状态设为 pending(1)，加入等待队列
+// 注意：这是V1 teleport的逻辑，V2架构使用ProcessTeleportV2
 func validateAndProcessTeleport(pinNode *pin.PinInscription, data mrc20.Mrc20TeleportTransferData, isMempool bool) ([]*mrc20.Mrc20Utxo, error) {
-	// 1. 验证必填字段
-	if data.Coord == "" {
-		return nil, fmt.Errorf("coord is required for teleport")
-	}
-	if data.Id == "" {
-		return nil, fmt.Errorf("id (tickId) is required for teleport")
-	}
-	if data.Amount == "" {
-		return nil, fmt.Errorf("amount is required for teleport")
-	}
-	if data.Chain == "" {
-		return nil, fmt.Errorf("chain (target chain) is required for teleport")
-	}
-
-	// 2. 检查是否已有对应的 teleport (防止重复处理)
-	// 包括检查 PendingTeleport（mempool 阶段创建的）
-	if PebbleStore.CheckTeleportExists(data.Coord) {
-		log.Printf("[Teleport] ❌ Rejected: teleport already exists for coord: %s, txId=%s", data.Coord, pinNode.GenesisTransaction)
-		return nil, fmt.Errorf("teleport already exists for coord: %s", data.Coord)
-	}
-
-	log.Printf("[Teleport] ✅ Processing new teleport: coord=%s, tickId=%s, amount=%s, chain=%s, txId=%s, isMempool=%v",
-		data.Coord, data.Id, data.Amount, data.Chain, pinNode.GenesisTransaction, isMempool)
-
-	// 检查是否已有 PendingTeleport（mempool 时创建）
-	existingPending, _ := PebbleStore.GetPendingTeleportByCoord(data.Coord)
-	if existingPending != nil && existingPending.Status == 0 {
-		// 需要先获取源UTXO来检查状态
-		// 先临时解析金额和查找UTXO
-		tempAmount, tempErr := decimal.NewFromString(data.Amount)
-		if tempErr != nil {
-			return nil, fmt.Errorf("invalid amount format: %s", data.Amount)
-		}
-		tempSourceUtxo, tempErr := findTeleportSourceUtxo(pinNode, data.Id, tempAmount)
-		if tempErr != nil {
-			return nil, fmt.Errorf("find source UTXO error: %w", tempErr)
-		}
-
-		// 关键检查：只有当源UTXO已经是TeleportPending状态时，才认为是重复处理
-		// 如果源UTXO还是Available状态，说明之前的PendingTeleport是孤儿记录，应该继续处理
-		if tempSourceUtxo.Status == mrc20.UtxoStatusTeleportPending {
-			// 源UTXO已经是pending状态，这是重复处理
-			// 区块确认时：更新 PendingTeleport 的 BlockHeight，并尝试完成 teleport
-			if !isMempool && pinNode.GenesisHeight > 0 {
-				log.Printf("[Teleport] PendingTeleport exists for coord %s, block confirmed at height %d, checking arrival",
-					data.Coord, pinNode.GenesisHeight)
-
-				// 更新 PendingTeleport 的区块高度
-				existingPending.BlockHeight = pinNode.GenesisHeight
-				existingPending.Timestamp = pinNode.Timestamp
-				PebbleStore.SavePendingTeleport(existingPending)
-
-				// 检查 arrival 是否已确认
-				arrival, err := PebbleStore.GetMrc20ArrivalByPinId(data.Coord)
-				if err == nil && arrival != nil && arrival.Status == mrc20.ArrivalStatusPending && arrival.BlockHeight > 0 {
-					// 双方都已确认，执行 teleport
-					log.Printf("[Teleport] Both sides confirmed! Teleport block=%d, Arrival block=%d, executing teleport",
-						pinNode.GenesisHeight, arrival.BlockHeight)
-					processPendingTeleportForArrival(arrival)
-				}
-			} else {
-				log.Printf("[Teleport] PendingTeleport already exists for coord %s (mempool), skipping", data.Coord)
-			}
-			return nil, nil
-		} else {
-			// 源UTXO还是Available状态，说明存在孤儿PendingTeleport记录
-			// 删除旧的PendingTeleport，继续处理
-			log.Printf("[Teleport] Found orphan PendingTeleport for coord %s (source UTXO is Available), deleting and reprocessing", data.Coord)
-			PebbleStore.DeletePendingTeleport(existingPending.PinId, existingPending.Coord)
-		}
-	}
-
-	// 3. 解析 teleport 金额
-	teleportAmount, err := decimal.NewFromString(data.Amount)
-	if err != nil {
-		return nil, fmt.Errorf("invalid amount format: %s", data.Amount)
-	}
-
-	// 4. 从交易输入获取匹配的 MRC20 UTXO
-	sourceUtxo, err := findTeleportSourceUtxo(pinNode, data.Id, teleportAmount)
-	if err != nil {
-		return nil, fmt.Errorf("find source UTXO error: %w", err)
-	}
-
-	// 5. 验证 UTXO 状态必须是可用(0)
-	// 不允许同一个 UTXO 有多个 teleport transfer
-	if sourceUtxo.Status != mrc20.UtxoStatusAvailable {
-		if sourceUtxo.Status == mrc20.UtxoStatusTeleportPending {
-			return nil, fmt.Errorf("UTXO %s is already in teleport pending state", sourceUtxo.TxPoint)
-		}
-		return nil, fmt.Errorf("UTXO %s is not available, status: %d", sourceUtxo.TxPoint, sourceUtxo.Status)
-	}
-
-	// 6. 检查是否有 arrival 记录
-	arrival, err := PebbleStore.GetMrc20ArrivalByPinId(data.Coord)
-	if err != nil {
-		// arrival 还未被索引，将 UTXO 设为 pending 状态，加入等待队列
-		log.Printf("[Teleport] Arrival not found for coord %s, setting UTXO to pending and adding to queue", data.Coord)
-
-		// 将 UTXO 状态设为 pending(1)
-		pendingUtxo := *sourceUtxo
-		pendingUtxo.Status = mrc20.UtxoStatusTeleportPending
-		pendingUtxo.Msg = fmt.Sprintf("teleport pending, waiting for arrival %s", data.Coord)
-		pendingUtxo.OperationTx = pinNode.GenesisTransaction
-
-		// 保存 pending teleport 记录
-		pending := &mrc20.PendingTeleport{
-			PinId:         pinNode.Id,
-			TxId:          pinNode.GenesisTransaction,
-			Coord:         data.Coord,
-			TickId:        data.Id,
-			Amount:        data.Amount,
-			AssetOutpoint: sourceUtxo.TxPoint, // 记录待跃迁的 UTXO
-			TargetChain:   data.Chain,
-			FromAddress:   pinNode.Address,
-			SourceChain:   pinNode.ChainName,
-			BlockHeight:   pinNode.GenesisHeight,
-			Timestamp:     pinNode.Timestamp,
-			RetryCount:    0,
-			Status:        0, // pending
-			RawContent:    pinNode.ContentBody,
-		}
-		err = PebbleStore.SavePendingTeleport(pending)
-		if err != nil {
-			log.Printf("[Teleport] ❌ SavePendingTeleport error: %v", err)
-		} else {
-			log.Printf("[Teleport] 💾 Saved PendingTeleport (arrival not found): coord=%s, asset=%s", data.Coord, sourceUtxo.TxPoint)
-		}
-
-		// 【新架构】更新源链 AccountBalance: Balance -= amount, PendingOut += amount, UtxoCount--
-		// 注意：UTXO 进入 pending 状态后，不再是"可用"的，所以 UtxoCount 减少
-		err = PebbleStore.UpdateMrc20AccountBalance(
-			pinNode.ChainName,
-			pinNode.Address,
-			sourceUtxo.Mrc20Id,
-			sourceUtxo.Tick,
-			teleportAmount.Neg(), // Balance -= amount
-			teleportAmount,       // PendingOut += amount
-			decimal.Zero,         // PendingIn 不变
-			-1,                   // UtxoCount--（UTXO 进入 pending 状态，不再可用）
-			pinNode.GenesisTransaction,
-			pinNode.GenesisHeight,
-			pinNode.Timestamp,
-		)
-		if err != nil {
-			log.Printf("[ERROR] UpdateMrc20AccountBalance failed for teleport pending: %v", err)
-		}
-
-		// 写入 Transaction 流水记录（teleport pending 状态）
-		pendingTx := &mrc20.Mrc20Transaction{
-			Chain:        pinNode.ChainName,
-			TxId:         pinNode.GenesisTransaction,
-			TxPoint:      sourceUtxo.TxPoint + "_pending",
-			TxIndex:      0,
-			PinId:        pinNode.Id,
-			TickId:       data.Id,
-			Tick:         sourceUtxo.Tick,
-			TxType:       "teleport_pending",
-			Direction:    "out", // 支出（pending 状态）
-			Address:      pinNode.Address,
-			FromAddress:  pinNode.Address,
-			ToAddress:    "",
-			Amount:       teleportAmount,
-			IsChange:     false,
-			SpentUtxos:   fmt.Sprintf("[\"%s\"]", sourceUtxo.TxPoint),
-			CreatedUtxos: "[]",
-			BlockHeight:  pinNode.GenesisHeight,
-			Timestamp:    pinNode.Timestamp,
-			Msg:          fmt.Sprintf("teleport pending, waiting for arrival %s", data.Coord),
-			Status:       1,
-			RelatedChain: data.Chain,
-			RelatedTxId:  "",
-			RelatedPinId: data.Coord,
-		}
-		if err := PebbleStore.SaveMrc20Transaction(pendingTx); err != nil {
-			log.Printf("[ERROR] SaveMrc20Transaction failed for teleport_pending: %v", err)
-		}
-
-		// 返回需要更新的 UTXO（状态变为 pending）
-		return []*mrc20.Mrc20Utxo{&pendingUtxo}, nil
-	}
-
-	// 7. arrival 存在，验证状态
-	log.Printf("[Teleport] Arrival found for coord %s: status=%d, blockHeight=%d, isMempool=%v, teleportMempool=%v",
-		data.Coord, arrival.Status, arrival.BlockHeight, isMempool, pinNode.GenesisHeight == -1)
-
-	if arrival.Status != mrc20.ArrivalStatusPending {
-		return nil, fmt.Errorf("arrival is not pending, status: %d (0=pending, 1=completed, 2=invalid)", arrival.Status)
-	}
-
-	// 8. 验证 arrival 数据与 teleport 数据匹配
-	if arrival.TickId != data.Id {
-		return nil, fmt.Errorf("tickId mismatch: arrival has %s, teleport has %s", arrival.TickId, data.Id)
-	}
-	if !arrival.Amount.Equal(teleportAmount) {
-		return nil, fmt.Errorf("amount mismatch: arrival has %s, teleport has %s", arrival.Amount.String(), teleportAmount.String())
-	}
-	if arrival.Chain != data.Chain {
-		return nil, fmt.Errorf("target chain mismatch: arrival is on %s, teleport targets %s", arrival.Chain, data.Chain)
-	}
-
-	// 9. 验证交易输入的 UTXO 与 arrival 声明的 assetOutpoint 匹配
-	if sourceUtxo.TxPoint != arrival.AssetOutpoint {
-		return nil, fmt.Errorf("UTXO mismatch: found %s in inputs, but arrival expects %s", sourceUtxo.TxPoint, arrival.AssetOutpoint)
-	}
-
-	// 【选项 B 修复】严格等待确认：mempool 阶段双方都不执行 teleport
-	// - 如果 teleport 或 arrival 任一还在 mempool，先保存 pending 状态
-	// - 只有双方都确认后才执行完整 teleport
-	isTeleportMempool := isMempool || pinNode.GenesisHeight == -1
-	isArrivalMempool := arrival.BlockHeight == -1
-
-	if isTeleportMempool || isArrivalMempool {
-		// mempool 阶段：保存 PendingTeleport，将 UTXO 设为 pending
-		log.Printf("[Teleport] Mempool stage: teleportMempool=%v, arrivalMempool=%v, saving pending state",
-			isTeleportMempool, isArrivalMempool)
-
-		// 将 UTXO 状态设为 pending
-		pendingUtxo := *sourceUtxo
-		pendingUtxo.Status = mrc20.UtxoStatusTeleportPending
-		pendingUtxo.Msg = fmt.Sprintf("teleport pending, waiting for confirmation (arrival in mempool: %v)", isArrivalMempool)
-		pendingUtxo.OperationTx = pinNode.GenesisTransaction
-
-		// 保存 pending teleport 记录
-		pending := &mrc20.PendingTeleport{
-			PinId:         pinNode.Id,
-			TxId:          pinNode.GenesisTransaction,
-			Coord:         data.Coord,
-			TickId:        data.Id,
-			Amount:        data.Amount,
-			AssetOutpoint: sourceUtxo.TxPoint,
-			TargetChain:   data.Chain,
-			FromAddress:   pinNode.Address,
-			SourceChain:   pinNode.ChainName,
-			BlockHeight:   pinNode.GenesisHeight,
-			Timestamp:     pinNode.Timestamp,
-			RetryCount:    0,
-			Status:        0, // pending
-			RawContent:    pinNode.ContentBody,
-		}
-		err = PebbleStore.SavePendingTeleport(pending)
-		if err != nil {
-			log.Printf("[Teleport] ❌ SavePendingTeleport error (mempool stage): %v", err)
-		} else {
-			log.Printf("[Teleport] 💾 Saved PendingTeleport (mempool stage, waiting for confirmation): coord=%s, teleportMempool=%v, arrivalMempool=%v",
-				data.Coord, isTeleportMempool, isArrivalMempool)
-		}
-
-		// 更新源链 AccountBalance: Balance -= amount, PendingOut += amount, UtxoCount--
-		err = PebbleStore.UpdateMrc20AccountBalance(
-			pinNode.ChainName,
-			pinNode.Address,
-			sourceUtxo.Mrc20Id,
-			sourceUtxo.Tick,
-			teleportAmount.Neg(), // Balance -= amount
-			teleportAmount,       // PendingOut += amount
-			decimal.Zero,         // PendingIn 不变
-			-1,                   // UtxoCount--
-			pinNode.GenesisTransaction,
-			pinNode.GenesisHeight,
-			pinNode.Timestamp,
-		)
-		if err != nil {
-			log.Printf("[ERROR] UpdateMrc20AccountBalance failed for teleport pending: %v", err)
-		}
-
-		// 保存 TeleportPendingIn 记录（接收方的 PendingIn）
-		log.Printf("[Teleport] Saving TeleportPendingIn for receiver: chain=%s, address=%s, amount=%s",
-			arrival.Chain, arrival.ToAddress, data.Amount)
-		saveTeleportPendingIn(arrival, pending)
-
-		// 写入 Transaction 流水记录（teleport pending 状态）
-		pendingTx := &mrc20.Mrc20Transaction{
-			Chain:        pinNode.ChainName,
-			TxId:         pinNode.GenesisTransaction,
-			TxPoint:      sourceUtxo.TxPoint + "_pending",
-			TxIndex:      0,
-			PinId:        pinNode.Id,
-			TickId:       data.Id,
-			Tick:         sourceUtxo.Tick,
-			TxType:       "teleport_pending",
-			Direction:    "out",
-			Address:      pinNode.Address,
-			FromAddress:  pinNode.Address,
-			ToAddress:    arrival.ToAddress,
-			Amount:       teleportAmount,
-			IsChange:     false,
-			SpentUtxos:   fmt.Sprintf("[\"%s\"]", sourceUtxo.TxPoint),
-			CreatedUtxos: "[]",
-			BlockHeight:  pinNode.GenesisHeight,
-			Timestamp:    pinNode.Timestamp,
-			Msg:          fmt.Sprintf("teleport pending, waiting for block confirmation"),
-			Status:       1,
-			RelatedChain: data.Chain,
-			RelatedTxId:  arrival.TxId,
-			RelatedPinId: data.Coord,
-		}
-		if err := PebbleStore.SaveMrc20Transaction(pendingTx); err != nil {
-			log.Printf("[ERROR] SaveMrc20Transaction failed for teleport_pending: %v", err)
-		}
-
-		// 返回需要更新的 UTXO（状态变为 pending）
-		return []*mrc20.Mrc20Utxo{&pendingUtxo}, nil
-	}
-
-	// 双方都已确认，执行跃迁
-	log.Printf("[Teleport] Both confirmed: teleport height=%d, arrival height=%d, executing teleport",
-		pinNode.GenesisHeight, arrival.BlockHeight)
-	return executeTeleportTransfer(pinNode, data, sourceUtxo, arrival, isMempool)
+	// V1 Logic deprecated - Use V2 ProcessTeleportV2 instead
+	return nil, fmt.Errorf("validateAndProcessTeleport is deprecated in V2, use ProcessTeleportV2")
 }
 
 // findTeleportSourceUtxo 从交易输入中查找符合 teleport 条件的 MRC20 UTXO

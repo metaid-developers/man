@@ -45,7 +45,7 @@ func mrc20JsonApi(r *gin.Engine) {
 	adminGroup.GET("/teleport/list-pending", listPendingTeleports)
 	adminGroup.GET("/teleport/diagnose/:coord", diagnoseTeleport)
 	adminGroup.GET("/teleport/check-arrival/:pinId", checkArrivalByPinId)
-	adminGroup.GET("/teleport/check-asset-index/:assetOutpoint", checkAssetIndex)
+	adminGroup.GET("/teleport/check-asset-index/:assetOutpoint", checkArrivalIndex)
 	adminGroup.POST("/teleport/fix/:coord", fixTeleport)
 
 	// Teleport V2 接口
@@ -180,7 +180,7 @@ func getBalanceByAddress(ctx *gin.Context) {
 	chainFilter := ctx.Query("chain")
 
 	// 💡 新架构：基于 UTXO 实时计算余额，不使用 AccountBalance 表
-	log.Printf("[API] 💡 使用 UTXO 实时计算余额: address=%s, chain=%s", address, chainFilter)
+	//log.Printf("[API] 💡 使用 UTXO 实时计算余额: address=%s, chain=%s", address, chainFilter)
 
 	var balanceList []*man.MRC20Balance
 
@@ -320,7 +320,7 @@ func getAddressBalance(ctx *gin.Context) {
 	}
 
 	// 💡 新架构：基于 UTXO 实时计算余额，不使用 AccountBalance 表
-	log.Printf("[API] 💡 使用 UTXO 实时计算余额: chain=%s, address=%s, tickId=%s", chain, address, tickId)
+	//log.Printf("[API] 💡 使用 UTXO 实时计算余额: chain=%s, address=%s, tickId=%s", chain, address, tickId)
 
 	balance, err := man.CalculateBalanceFromUTXO(chain, address, tickId)
 	if err != nil {
@@ -1165,238 +1165,20 @@ func deleteSnapshot(ctx *gin.Context) {
 // listPendingTeleports 列出所有pending状态的teleport
 // GET /api/mrc20/admin/teleport/list-pending
 func listPendingTeleports(ctx *gin.Context) {
-	pendingList, err := man.PebbleStore.GetAllPendingTeleports()
-	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, respond.ApiError(0, "Failed to get pending teleports: "+err.Error()))
-		return
-	}
-
-	type TeleportInfo struct {
-		PinId           string              `json:"pinId"`
-		TxId            string              `json:"txId"`
-		Coord           string              `json:"coord"`
-		TickId          string              `json:"tickId"`
-		Amount          string              `json:"amount"`
-		FromAddress     string              `json:"fromAddress"`
-		SourceChain     string              `json:"sourceChain"`
-		TargetChain     string              `json:"targetChain"`
-		BlockHeight     int64               `json:"blockHeight"`
-		Status          int                 `json:"status"`
-		AssetOutpoint   string              `json:"assetOutpoint"`
-		ArrivalExists   bool                `json:"arrivalExists"`
-		ArrivalStatus   mrc20.ArrivalStatus `json:"arrivalStatus,omitempty"`
-		ArrivalHeight   int64               `json:"arrivalHeight,omitempty"`
-		PendingInExists bool                `json:"pendingInExists"`
-		UtxoStatus      int                 `json:"utxoStatus,omitempty"`
-		Problem         string              `json:"problem,omitempty"`
-	}
-
-	result := make([]TeleportInfo, 0, len(pendingList))
-
-	for _, pending := range pendingList {
-		info := TeleportInfo{
-			PinId:         pending.PinId,
-			TxId:          pending.TxId,
-			Coord:         pending.Coord,
-			TickId:        pending.TickId,
-			Amount:        pending.Amount,
-			FromAddress:   pending.FromAddress,
-			SourceChain:   pending.SourceChain,
-			TargetChain:   pending.TargetChain,
-			BlockHeight:   pending.BlockHeight,
-			Status:        pending.Status,
-			AssetOutpoint: pending.AssetOutpoint,
-		}
-
-		// 检查arrival
-		arrival, err := man.PebbleStore.GetMrc20ArrivalByPinId(pending.Coord)
-		if err == nil && arrival != nil {
-			info.ArrivalExists = true
-			info.ArrivalStatus = arrival.Status
-			info.ArrivalHeight = arrival.BlockHeight
-		}
-
-		// 检查TeleportPendingIn
-		pendingIn, err := man.PebbleStore.GetTeleportPendingInByCoord(pending.Coord)
-		if err == nil && pendingIn != nil {
-			info.PendingInExists = true
-		}
-
-		// 检查源UTXO
-		utxo, err := man.PebbleStore.GetMrc20UtxoByTxPoint(pending.AssetOutpoint, false)
-		if err == nil && utxo != nil {
-			info.UtxoStatus = utxo.Status
-		}
-
-		// 诊断问题
-		if pending.Status == 0 {
-			if !info.ArrivalExists {
-				info.Problem = "Arrival not found, teleport is waiting"
-			} else if info.ArrivalHeight <= 0 {
-				info.Problem = "Arrival still in mempool"
-			} else if pending.BlockHeight <= 0 {
-				info.Problem = "Teleport blockHeight not updated (stuck)"
-			} else if info.ArrivalStatus != mrc20.ArrivalStatusPending {
-				info.Problem = fmt.Sprintf("Arrival status is not pending (status=%d)", info.ArrivalStatus)
-			} else if !info.PendingInExists {
-				info.Problem = "TeleportPendingIn not created (receiver has no pendingIn)"
-			} else {
-				info.Problem = "Ready to process (both confirmed)"
-			}
-		}
-
-		result = append(result, info)
-	}
-
-	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{
-		"total":     len(result),
-		"teleports": result,
-	}))
+	// V1 API - deprecated in V2
+	ctx.JSON(http.StatusOK, respond.ApiError(0, "listPendingTeleports (V1) is deprecated, use V2 teleport APIs"))
 }
 
 // diagnoseTeleport 诊断指定的teleport
 // GET /api/mrc20/admin/teleport/diagnose/:coord
 func diagnoseTeleport(ctx *gin.Context) {
-	coord := ctx.Param("coord")
-	if coord == "" {
-		ctx.JSON(http.StatusBadRequest, respond.ApiError(0, "coord parameter is required"))
-		return
-	}
-
-	// 查找PendingTeleport
-	pending, err := man.PebbleStore.GetPendingTeleportByCoord(coord)
-	var pendingInfo map[string]interface{}
-	if err != nil || pending == nil {
-		pendingInfo = map[string]interface{}{"exists": false}
-	} else {
-		pendingInfo = map[string]interface{}{
-			"exists":        true,
-			"pinId":         pending.PinId,
-			"txId":          pending.TxId,
-			"status":        pending.Status,
-			"blockHeight":   pending.BlockHeight,
-			"amount":        pending.Amount,
-			"assetOutpoint": pending.AssetOutpoint,
-			"sourceChain":   pending.SourceChain,
-			"targetChain":   pending.TargetChain,
-			"fromAddress":   pending.FromAddress,
-		}
-	}
-
-	// 查找Arrival - 通过coord (PinId)
-	arrivalByCoord, err := man.PebbleStore.GetMrc20ArrivalByPinId(coord)
-	var arrivalInfo map[string]interface{}
-
-	if err != nil || arrivalByCoord == nil {
-		arrivalInfo = map[string]interface{}{
-			"exists": false,
-			"note":   "Arrival not found by coord (PinId)",
-		}
-	} else {
-		arrivalInfo = map[string]interface{}{
-			"exists":      true,
-			"pinId":       arrivalByCoord.PinId,
-			"txId":        arrivalByCoord.TxId,
-			"status":      arrivalByCoord.Status,
-			"blockHeight": arrivalByCoord.BlockHeight,
-			"amount":      arrivalByCoord.Amount.String(),
-			"toAddress":   arrivalByCoord.ToAddress,
-			"chain":       arrivalByCoord.Chain,
-		}
-	}
-
-	// 通过assetOutpoint查询arrival
-	var arrivalByAsset *mrc20.Mrc20Arrival
-	if pending != nil && pending.AssetOutpoint != "" {
-		arrivalByAsset, _ = man.PebbleStore.GetMrc20ArrivalByAssetOutpoint(pending.AssetOutpoint)
-	}
-
-	var arrivalByAssetInfo map[string]interface{}
-	if arrivalByAsset != nil {
-		arrivalByAssetInfo = map[string]interface{}{
-			"exists":      true,
-			"pinId":       arrivalByAsset.PinId,
-			"txId":        arrivalByAsset.TxId,
-			"status":      arrivalByAsset.Status,
-			"blockHeight": arrivalByAsset.BlockHeight,
-			"amount":      arrivalByAsset.Amount.String(),
-			"toAddress":   arrivalByAsset.ToAddress,
-			"chain":       arrivalByAsset.Chain,
-			"note":        "Found by assetOutpoint instead of coord",
-		}
-	} else {
-		arrivalByAssetInfo = map[string]interface{}{
-			"exists": false,
-			"note":   "Arrival not found by assetOutpoint either",
-		}
-	}
-
-	// 查找TeleportPendingIn
-	pendingIn, err := man.PebbleStore.GetTeleportPendingInByCoord(coord)
-	var pendingInInfo map[string]interface{}
-	if err != nil || pendingIn == nil {
-		pendingInInfo = map[string]interface{}{"exists": false}
-	} else {
-		pendingInInfo = map[string]interface{}{
-			"exists":    true,
-			"amount":    pendingIn.Amount.String(),
-			"toAddress": pendingIn.ToAddress,
-			"chain":     pendingIn.Chain,
-		}
-	}
-
-	// 诊断结果
-	diagnosis := []string{}
-	canFix := false
-
-	// 决定使用哪个arrival进行诊断
-	var arrivalForDiagnosis *mrc20.Mrc20Arrival
-	if arrivalByCoord != nil {
-		arrivalForDiagnosis = arrivalByCoord
-	} else if arrivalByAsset != nil {
-		arrivalForDiagnosis = arrivalByAsset
-		diagnosis = append(diagnosis, "⚠️ Arrival found by assetOutpoint, but coord mismatch!")
-		diagnosis = append(diagnosis, fmt.Sprintf("   Expected coord: %s", coord))
-		diagnosis = append(diagnosis, fmt.Sprintf("   Actual arrival PinId: %s", arrivalByAsset.PinId))
-	}
-
-	if pending == nil {
-		diagnosis = append(diagnosis, "❌ PendingTeleport not found")
-	} else if pending.Status != 0 {
-		diagnosis = append(diagnosis, fmt.Sprintf("ℹ️ PendingTeleport status: %d (0=pending, 1=completed, -1=invalid)", pending.Status))
-	} else {
-		if arrivalForDiagnosis == nil {
-			diagnosis = append(diagnosis, "⏳ Arrival not found by coord or assetOutpoint, teleport is waiting")
-		} else if arrivalForDiagnosis.BlockHeight <= 0 {
-			diagnosis = append(diagnosis, "⏳ Arrival still in mempool")
-		} else if pending.BlockHeight <= 0 {
-			diagnosis = append(diagnosis, "⚠️ Teleport blockHeight not updated (may be stuck)")
-		} else if arrivalForDiagnosis.Status != mrc20.ArrivalStatusPending {
-			diagnosis = append(diagnosis, fmt.Sprintf("❌ Arrival status is not pending (status=%d)", arrivalForDiagnosis.Status))
-		} else if pendingIn == nil {
-			diagnosis = append(diagnosis, "⚠️ TeleportPendingIn not created (receiver has no pendingIn)")
-			canFix = true
-		} else {
-			diagnosis = append(diagnosis, "✅ Both confirmed and PendingIn exists, ready to process")
-			canFix = true
-		}
-	}
-
-	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{
-		"coord":          coord,
-		"pending":        pendingInfo,
-		"arrival":        arrivalInfo,
-		"arrivalByAsset": arrivalByAssetInfo,
-		"pendingIn":      pendingInInfo,
-		"diagnosis":      diagnosis,
-		"canFix":         canFix,
-	}))
+	// V1 API - deprecated in V2
+	ctx.JSON(http.StatusOK, respond.ApiError(0, "diagnoseTeleport (V1) is deprecated, use V2 teleport APIs"))
 }
 
-// checkAssetIndex 检查assetOutpoint索引指向的PinId（用于调试）
-// GET /api/mrc20/admin/teleport/check-asset-index/:assetOutpoint
-func checkAssetIndex(ctx *gin.Context) {
-	assetOutpoint := ctx.Param("assetOutpoint")
+// checkArrivalIndex 检查 arrival 在索引中的状态
+func checkArrivalIndex(ctx *gin.Context) {
+	assetOutpoint := ctx.Query("assetOutpoint")
 	if assetOutpoint == "" {
 		ctx.JSON(http.StatusBadRequest, respond.ApiError(0, "assetOutpoint parameter is required"))
 		return

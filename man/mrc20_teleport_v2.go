@@ -8,8 +8,10 @@ import (
 	"manindexer/mrc20"
 	"manindexer/pin"
 	"os"
+	"strings"
 	"time"
 
+	"github.com/bytedance/sonic"
 	"github.com/shopspring/decimal"
 )
 
@@ -81,14 +83,29 @@ func ProcessTeleportV2(pinNode *pin.PinInscription, data mrc20.Mrc20TeleportTran
 		return fmt.Errorf("teleport failed: %s", tx.FailureReason)
 	}
 
-	// 5. 尝试获取锁（防止并发处理）
+	// 5. ✅ Block 阶段：更新 TeleportTransaction 的区块高度（mempool → block 转换）
+	// 🔧 关键：流水记录在 Step 4 才创建，此时只需更新 tx.SourceBlockHeight
+	// Step 4 创建流水时会使用更新后的 SourceBlockHeight
+	if !isMempool && pinNode.GenesisHeight > 0 && tx.SourceBlockHeight != pinNode.GenesisHeight {
+		log.Printf("[TeleportV2] 🔄 Updating SourceBlockHeight: %d -> %d", tx.SourceBlockHeight, pinNode.GenesisHeight)
+		tx.SourceBlockHeight = pinNode.GenesisHeight
+	}
+
+	// 6. 尝试获取锁（防止并发处理）
 	if !tx.AcquireLock(ProcessID, 5*time.Minute) {
 		log.Printf("[TeleportV2] 🔒 Locked by another process: %s (lockedBy=%s, expires=%d)",
 			teleportID, tx.LockedBy, tx.LockExpiresAt)
 		return nil // 等待锁释放或过期
 	}
+
+	var execErr error
 	defer func() {
 		tx.ReleaseLock(ProcessID)
+		// 如果是 "waiting for arrival" 错误，TeleportTransaction 已被删除，不需要保存
+		if execErr != nil && strings.Contains(execErr.Error(), "waiting for arrival") {
+			log.Printf("[TeleportV2] ⏸️  Skipping save (waiting for arrival)")
+			return
+		}
 		SaveTeleportTransaction(tx) // 释放锁时保存状态
 	}()
 
@@ -98,7 +115,8 @@ func ProcessTeleportV2(pinNode *pin.PinInscription, data mrc20.Mrc20TeleportTran
 		operator = "block"
 	}
 
-	return ExecuteTeleportStateMachine(tx, pinNode, data, operator)
+	execErr = ExecuteTeleportStateMachine(tx, pinNode, data, operator)
+	return execErr
 }
 
 // ExecuteTeleportStateMachine 执行状态机
@@ -141,6 +159,12 @@ func ExecuteTeleportStateMachine(tx *mrc20.TeleportTransaction, pinNode *pin.Pin
 			log.Printf("[TeleportV2] ❌ Step failed: state=%s, error=%v",
 				mrc20.GetStateName(tx.State), err)
 
+			// 🔧 特殊处理：如果是 "waiting for arrival" 错误，直接返回，不标记为失败
+			if strings.Contains(err.Error(), "waiting for arrival") {
+				log.Printf("[TeleportV2] ⏸️  Waiting for arrival, skipping failure marking")
+				return err
+			}
+
 			// 根据错误类型决定是否回滚
 			if shouldRollback(tx.State) {
 				return rollbackTeleport(tx, err.Error())
@@ -166,13 +190,56 @@ func ExecuteTeleportStateMachine(tx *mrc20.TeleportTransaction, pinNode *pin.Pin
 func stepLockSourceUTXO(tx *mrc20.TeleportTransaction, pinNode *pin.PinInscription, data mrc20.Mrc20TeleportTransferData) error {
 	log.Printf("[TeleportV2] Step 1: Locking source UTXO")
 
-	// ⚠️ 关键修复：在锁定资产前，先验证Arrival存在
-	// 避免锁定后发现Arrival不存在导致资金卡住
+	// ⚠️ 双向等待机制：在锁定资产前，先验证Arrival存在
+	// 如果Arrival不存在，保存到Pending队列等待Arrival到达后配对
 	log.Printf("[TeleportV2] Pre-check: Verifying arrival exists before locking")
 	arrival, err := PebbleStore.GetMrc20ArrivalByPinId(tx.Coord)
 	if err != nil {
-		return fmt.Errorf("arrival not found (pre-check failed): %w", err)
+		// 🔧 防止重复保存：检查是否已经保存过 PendingTeleport
+		existingPending, _ := GetPendingTeleport(tx.Coord)
+		if existingPending != nil && existingPending.SourceTxId == pinNode.GenesisTransaction {
+			log.Printf("[TeleportV2] ⏸️  Already in pending queue, coord=%s. Skipping duplicate save.", tx.Coord)
+			// 删除 TeleportTransaction，避免重复处理
+			DeleteTeleportTransaction(tx.ID)
+			return fmt.Errorf("waiting for arrival (already in pending queue)")
+		}
+
+		// Arrival不存在：保存到Pending队列，等待Arrival到达
+		log.Printf("[TeleportV2] ⏸️  Arrival not found yet, coord=%s. Saving to pending queue...", tx.Coord)
+
+		// 序列化pinNode供后续重新处理
+		pinNodeData, err := sonic.Marshal(pinNode)
+		if err != nil {
+			return fmt.Errorf("serialize pinNode failed: %w", err)
+		}
+
+		pending := &mrc20.PendingTeleport{
+			Coord:       tx.Coord,
+			Type:        "transfer", // 标识是Transfer先到达
+			SourceTxId:  pinNode.GenesisTransaction,
+			SourcePinId: pinNode.Id,
+			SourceChain: tx.SourceChain,
+			TargetChain: tx.TargetChain,
+			Data:        data,
+			PinNodeJson: string(pinNodeData),
+			CreatedAt:   time.Now().Unix(),
+			ExpireAt:    time.Now().Add(24 * time.Hour).Unix(), // 24小时过期
+			RetryCount:  0,
+		}
+
+		if err := SavePendingTeleport(pending); err != nil {
+			return fmt.Errorf("save pending teleport failed: %w", err)
+		}
+
+		log.Printf("[TeleportV2] ✅ Saved to pending queue, waiting for arrival: coord=%s", tx.Coord)
+
+		// 删除 TeleportTransaction，避免重复处理
+		DeleteTeleportTransaction(tx.ID)
+
+		// 返回特殊错误，表示正在等待 Arrival
+		return fmt.Errorf("waiting for arrival")
 	}
+
 	if arrival.Status != mrc20.ArrivalStatusPending {
 		return fmt.Errorf("arrival not pending (pre-check failed): status=%d", arrival.Status)
 	}
@@ -220,37 +287,13 @@ func stepLockSourceUTXO(tx *mrc20.TeleportTransaction, pinNode *pin.PinInscripti
 		return fmt.Errorf("update UTXO failed: %w", err)
 	}
 
-	log.Printf("[TeleportV2] 💡 余额通过UTXO状态实时计算: Balance = Available, PendingOut = TeleportPending")
+	log.Printf("[TeleportV2] 💡 余额通过UTXO状态实时计算:")
+	log.Printf("   - Balance = sum(Available + TeleportPending) [资金还在链上]")
+	log.Printf("   - PendingOut = sum(TeleportPending) [显示正在跃迁的金额]")
 
-	// 6. 写入pending流水
-	pendingTx := &mrc20.Mrc20Transaction{
-		Chain:        tx.SourceChain,
-		TxId:         pinNode.GenesisTransaction,
-		TxPoint:      tx.SourceOutpoint + "_pending",
-		TxIndex:      0,
-		PinId:        pinNode.Id,
-		TickId:       tx.TickId,
-		Tick:         tx.Tick,
-		TxType:       "teleport_pending",
-		Direction:    "out",
-		Address:      tx.FromAddress,
-		FromAddress:  tx.FromAddress,
-		ToAddress:    "",
-		Amount:       tx.Amount,
-		IsChange:     false,
-		SpentUtxos:   fmt.Sprintf("[\"%s\"]", tx.SourceOutpoint),
-		CreatedUtxos: "[]",
-		BlockHeight:  pinNode.GenesisHeight,
-		Timestamp:    pinNode.Timestamp,
-		Msg:          fmt.Sprintf("teleport pending, coord=%s", tx.Coord),
-		Status:       1,
-		RelatedChain: tx.TargetChain,
-		RelatedTxId:  "",
-		RelatedPinId: tx.Coord,
-	}
-	if err := PebbleStore.SaveMrc20Transaction(pendingTx); err != nil {
-		log.Printf("[TeleportV2] ⚠️  Failed to save pending transaction: %v", err)
-	}
+	// 💡 新架构：不在 Step 1 创建 pending 流水
+	// 原因：UTXO状态已经是TeleportPending，余额接口会自动计算PendingOut
+	// 只在 Step 4 完成时创建最终的 out/in 流水记录
 
 	// 8. 状态转换
 	tx.AddStateChange(mrc20.TeleportStateSourceLocked, true, "", "lock")
@@ -275,9 +318,14 @@ func stepVerifyArrival(tx *mrc20.TeleportTransaction, pinNode *pin.PinInscriptio
 	}
 
 	// 3. 验证assetOutpoint匹配（这个在step1无法验证，因为当时还没有sourceOutpoint）
+	log.Printf("[TeleportV2] 🔍 Verifying assetOutpoint: arrival=%s, source=%s", arrival.AssetOutpoint, tx.SourceOutpoint)
 	if arrival.AssetOutpoint != tx.SourceOutpoint {
+		log.Printf("[TeleportV2] ❌ AssetOutpoint mismatch! This will prevent PendingIn creation!")
+		log.Printf("[TeleportV2]    Arrival declared: %s", arrival.AssetOutpoint)
+		log.Printf("[TeleportV2]    Transfer using:   %s", tx.SourceOutpoint)
 		return fmt.Errorf("assetOutpoint mismatch: arrival=%s, source=%s", arrival.AssetOutpoint, tx.SourceOutpoint)
 	}
+	log.Printf("[TeleportV2] ✅ AssetOutpoint matched")
 
 	// 5. 创建目标链的 PendingIn 记录（目标UTXO还未创建，所以用单独的PendingIn记录）
 	pendingIn := &mrc20.TeleportPendingIn{
@@ -295,10 +343,12 @@ func stepVerifyArrival(tx *mrc20.TeleportTransaction, pinNode *pin.PinInscriptio
 		Timestamp:   arrival.Timestamp,
 	}
 	if err := PebbleStore.SaveTeleportPendingIn(pendingIn); err != nil {
-		log.Printf("[TeleportV2] ⚠️  Failed to save PendingIn: %v", err)
+		return fmt.Errorf("failed to save PendingIn: %w", err)
 	}
 
 	log.Printf("[TeleportV2] 💡 目标链PendingIn通过TeleportPendingIn记录，查询时实时计算")
+	log.Printf("[TeleportV2] 💡 该记录将在Step4创建目标UTXO后删除，避免重复计算")
+	log.Printf("[TeleportV2] ✅ Created PendingIn: chain=%s, toAddress=%s, amount=%s", tx.TargetChain, arrival.ToAddress, tx.Amount)
 
 	// 7. 状态转换
 	tx.AddStateChange(mrc20.TeleportStateArrivalVerified, true, "", "verify")
@@ -349,6 +399,19 @@ func stepCreateTargetUTXO(tx *mrc20.TeleportTransaction, pinNode *pin.PinInscrip
 		return fmt.Errorf("arrival not found: %w", err)
 	}
 
+	// 🔧 重要：重新加载 arrival 的最新 pinNode，获取最新的 BlockHeight
+	// arrival 记录可能是 mempool 阶段保存的（BlockHeight=-1），需要更新为出块后的高度
+	if arrival.PinId != "" {
+		arrivalPinNode, err := PebbleStore.GetPinById(arrival.PinId)
+		if err != nil {
+			log.Printf("[TeleportV2] ⚠️  Failed to reload arrival pinNode: %v, using cached version", err)
+		} else if arrivalPinNode.GenesisHeight > 0 && arrivalPinNode.GenesisHeight != arrival.BlockHeight {
+			log.Printf("[TeleportV2] 🔄 Updated arrival height: %d -> %d", arrival.BlockHeight, arrivalPinNode.GenesisHeight)
+			arrival.BlockHeight = arrivalPinNode.GenesisHeight
+			arrival.Timestamp = arrivalPinNode.Timestamp
+		}
+	}
+
 	// 2. 生成目标UTXO的txpoint
 	targetOutpoint := fmt.Sprintf("%s:%d", arrival.TxId, arrival.LocationIndex)
 	tx.TargetOutpoint = targetOutpoint
@@ -394,7 +457,75 @@ func stepCreateTargetUTXO(tx *mrc20.TeleportTransaction, pinNode *pin.PinInscrip
 		return fmt.Errorf("save target UTXO failed: %w", err)
 	}
 
-	// 6. 状态转换
+	// 6. 🔧 创建流水记录（在创建 UTXO 的同时创建，确保不会遗漏）
+	// 源链流水（teleport_out）
+	sourceTx := &mrc20.Mrc20Transaction{
+		Chain:        tx.SourceChain,
+		TxId:         tx.SourceTxId,
+		TxPoint:      tx.SourceOutpoint + "_out",
+		TxIndex:      0,
+		PinId:        pinNode.Id,
+		TickId:       tx.TickId,
+		Tick:         tx.Tick,
+		TxType:       "teleport_out",
+		Direction:    "out",
+		Address:      tx.FromAddress,
+		FromAddress:  tx.FromAddress,
+		ToAddress:    tx.ToAddress,
+		Amount:       tx.Amount,
+		IsChange:     false,
+		SpentUtxos:   fmt.Sprintf("[\"%s\"]", tx.SourceOutpoint),
+		CreatedUtxos: "[]",
+		BlockHeight:  tx.SourceBlockHeight,
+		Timestamp:    pinNode.Timestamp,
+		Msg:          fmt.Sprintf("teleport to %s", tx.TargetChain),
+		Status:       1,
+		RelatedChain: tx.TargetChain,
+		RelatedTxId:  arrival.TxId,
+		RelatedPinId: arrival.PinId,
+	}
+	if err := PebbleStore.SaveMrc20Transaction(sourceTx); err != nil {
+		log.Printf("[TeleportV2] ⚠️  Failed to save source transaction: %v", err)
+	}
+
+	// 目标链流水（teleport_in）
+	targetTx := &mrc20.Mrc20Transaction{
+		Chain:        tx.TargetChain,
+		TxId:         arrival.TxId,
+		TxPoint:      targetOutpoint,
+		TxIndex:      0,
+		PinId:        arrival.PinId,
+		TickId:       tx.TickId,
+		Tick:         tx.Tick,
+		TxType:       "teleport_in",
+		Direction:    "in",
+		Address:      tx.ToAddress,
+		FromAddress:  tx.FromAddress,
+		ToAddress:    tx.ToAddress,
+		Amount:       tx.Amount,
+		IsChange:     false,
+		SpentUtxos:   "[]",
+		CreatedUtxos: fmt.Sprintf("[\"%s\"]", targetOutpoint),
+		BlockHeight:  arrival.BlockHeight,
+		Timestamp:    arrival.Timestamp,
+		Msg:          fmt.Sprintf("teleport from %s", tx.SourceChain),
+		Status:       1,
+		RelatedChain: tx.SourceChain,
+		RelatedTxId:  tx.SourceTxId,
+		RelatedPinId: pinNode.Id,
+	}
+	if err := PebbleStore.SaveMrc20Transaction(targetTx); err != nil {
+		log.Printf("[TeleportV2] ⚠️  Failed to save target transaction: %v", err)
+	}
+
+	// 7. 删除TeleportPendingIn记录（避免重复计算余额）
+	// 目标UTXO已创建（Available状态），不再需要PendingIn记录
+	if err := PebbleStore.DeleteTeleportPendingIn(tx.Coord, tx.ToAddress); err != nil {
+		log.Printf("[TeleportV2] ⚠️  Failed to delete PendingIn: %v", err)
+	}
+	log.Printf("[TeleportV2] ✅ Deleted TeleportPendingIn to avoid double counting")
+
+	// 8. 状态转换
 	tx.AddStateChange(mrc20.TeleportStateTargetCreated, true, "", "create")
 	log.Printf("[TeleportV2] ✅ Target UTXO created: %s", targetOutpoint)
 
@@ -437,10 +568,10 @@ func stepUpdateBalances(tx *mrc20.TeleportTransaction, pinNode *pin.PinInscripti
 
 	log.Printf("[TeleportV2] ✅ UTXO states verified: source=Spent, target=Available")
 	log.Printf("[TeleportV2] 💡 余额计算说明:")
-	log.Printf("   - 源链Balance: sum(UTXO where status=Available)")
+	log.Printf("   - 源链Balance: sum(UTXO where status=Available) [源UTXO已Spent，不再计入]")
 	log.Printf("   - 源链PendingOut: sum(UTXO where status=TeleportPending) [源UTXO已Spent，不再计入]")
-	log.Printf("   - 目标链Balance: sum(UTXO where status=Available) [包含新创建的目标UTXO]")
-	log.Printf("   - 目标链PendingIn: TeleportPendingIn记录 [将在下一步删除]")
+	log.Printf("   - 目标链Balance: sum(UTXO where status=Available) [包含Step4创建的目标UTXO]")
+	log.Printf("   - 目标链PendingIn: TeleportPendingIn记录 [已在Step4删除，避免重复计算]")
 
 	// 状态转换
 	tx.AddStateChange(mrc20.TeleportStateBalanceUpdated, true, "", "verify")
@@ -448,7 +579,8 @@ func stepUpdateBalances(tx *mrc20.TeleportTransaction, pinNode *pin.PinInscripti
 	return nil
 }
 
-// stepFinalizeTeleport 步骤6: 完成Teleport（写入流水、更新状态）
+// stepFinalizeTeleport 步骤6: 完成Teleport（更新Arrival状态）
+// 注意：流水记录已在 stepCreateTargetUTXO 中创建，这里只更新状态
 func stepFinalizeTeleport(tx *mrc20.TeleportTransaction, pinNode *pin.PinInscription, data mrc20.Mrc20TeleportTransferData) error {
 	log.Printf("[TeleportV2] Step 6: Finalizing teleport")
 
@@ -457,67 +589,7 @@ func stepFinalizeTeleport(tx *mrc20.TeleportTransaction, pinNode *pin.PinInscrip
 		return fmt.Errorf("arrival not found: %w", err)
 	}
 
-	// 1. 写入源链流水（teleport_out）
-	sourceTx := &mrc20.Mrc20Transaction{
-		Chain:        tx.SourceChain,
-		TxId:         tx.SourceTxId,
-		TxPoint:      tx.SourceOutpoint + "_out",
-		TxIndex:      0,
-		PinId:        pinNode.Id,
-		TickId:       tx.TickId,
-		Tick:         tx.Tick,
-		TxType:       "teleport_out",
-		Direction:    "out",
-		Address:      tx.FromAddress,
-		FromAddress:  tx.FromAddress,
-		ToAddress:    tx.ToAddress,
-		Amount:       tx.Amount,
-		IsChange:     false,
-		SpentUtxos:   fmt.Sprintf("[\"%s\"]", tx.SourceOutpoint),
-		CreatedUtxos: "[]",
-		BlockHeight:  tx.SourceBlockHeight,
-		Timestamp:    pinNode.Timestamp,
-		Msg:          fmt.Sprintf("teleport to %s", tx.TargetChain),
-		Status:       1,
-		RelatedChain: tx.TargetChain,
-		RelatedTxId:  arrival.TxId,
-		RelatedPinId: arrival.PinId,
-	}
-	if err := PebbleStore.SaveMrc20Transaction(sourceTx); err != nil {
-		log.Printf("[TeleportV2] ⚠️  Failed to save source transaction: %v", err)
-	}
-
-	// 2. 写入目标链流水（teleport_in）
-	targetTx := &mrc20.Mrc20Transaction{
-		Chain:        tx.TargetChain,
-		TxId:         arrival.TxId,
-		TxPoint:      tx.TargetOutpoint,
-		TxIndex:      0,
-		PinId:        arrival.PinId,
-		TickId:       tx.TickId,
-		Tick:         tx.Tick,
-		TxType:       "teleport_in",
-		Direction:    "in",
-		Address:      tx.ToAddress,
-		FromAddress:  tx.FromAddress,
-		ToAddress:    tx.ToAddress,
-		Amount:       tx.Amount,
-		IsChange:     false,
-		SpentUtxos:   "[]",
-		CreatedUtxos: fmt.Sprintf("[\"%s\"]", tx.TargetOutpoint),
-		BlockHeight:  arrival.BlockHeight,
-		Timestamp:    arrival.Timestamp,
-		Msg:          fmt.Sprintf("teleport from %s", tx.SourceChain),
-		Status:       1,
-		RelatedChain: tx.SourceChain,
-		RelatedTxId:  tx.SourceTxId,
-		RelatedPinId: pinNode.Id,
-	}
-	if err := PebbleStore.SaveMrc20Transaction(targetTx); err != nil {
-		log.Printf("[TeleportV2] ⚠️  Failed to save target transaction: %v", err)
-	}
-
-	// 3. 更新Arrival状态
+	// 更新Arrival状态为已完成
 	err = PebbleStore.UpdateMrc20ArrivalStatus(
 		arrival.PinId,
 		mrc20.ArrivalStatusCompleted,
@@ -530,11 +602,8 @@ func stepFinalizeTeleport(tx *mrc20.TeleportTransaction, pinNode *pin.PinInscrip
 		log.Printf("[TeleportV2] ⚠️  Failed to update arrival status: %v", err)
 	}
 
-	// 4. 删除PendingIn记录
-	err = PebbleStore.DeleteTeleportPendingIn(tx.Coord, tx.ToAddress)
-	if err != nil {
-		log.Printf("[TeleportV2] ⚠️  Failed to delete PendingIn: %v", err)
-	}
+	// 4. TeleportPendingIn已在Step4删除，这里不需要重复删除
+	// （保留注释以便理解）
 
 	// 5. 保存完成的Teleport记录（用于CheckTeleportExists）
 	teleportRecord := &mrc20.Mrc20Teleport{

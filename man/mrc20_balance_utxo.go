@@ -61,10 +61,12 @@ func CalculateBalanceFromUTXO(chain, address, tickId string) (*MRC20Balance, err
 			log.Printf("[Balance] MintPending UTXO: %s, amt=%s, pendingIn=%s", utxo.TxPoint, utxo.AmtChange, balance.PendingIn)
 
 		case mrc20.UtxoStatusTeleportPending:
-			// Teleport pending out
+			// Teleport pending: 资金还在链上等待跃迁，同时计入balance和pendingOut
+			// balance保持不变（实际还未离开链），pendingOut显示正在跃迁的金额
+			balance.Balance = balance.Balance.Add(utxo.AmtChange)
 			balance.PendingOut = balance.PendingOut.Add(utxo.AmtChange)
 			balance.PendingUtxos++
-			log.Printf("[Balance] TeleportPending UTXO: %s, amt=%s, pendingOut=%s", utxo.TxPoint, utxo.AmtChange, balance.PendingOut)
+			log.Printf("[Balance] TeleportPending UTXO: %s, amt=%s, balance=%s, pendingOut=%s", utxo.TxPoint, utxo.AmtChange, balance.Balance, balance.PendingOut)
 
 		case mrc20.UtxoStatusTransferPending:
 			// Transfer pending: 通过AmtChange正负区分输入/输出UTXO
@@ -107,6 +109,10 @@ func CalculateBalanceFromUTXO(chain, address, tickId string) (*MRC20Balance, err
 		for _, pendingIn := range teleportPendingIns {
 			if pendingIn.Chain == chain && pendingIn.TickId == tickId {
 				balance.PendingIn = balance.PendingIn.Add(pendingIn.Amount)
+				// 如果没有UTXO，从PendingIn获取Tick名称
+				if balance.Tick == "" {
+					balance.Tick = pendingIn.Tick
+				}
 			}
 		}
 	}
@@ -117,11 +123,25 @@ func CalculateBalanceFromUTXO(chain, address, tickId string) (*MRC20Balance, err
 		for _, pendingIn := range transferPendingIns {
 			if pendingIn.Chain == chain && pendingIn.TickId == tickId {
 				balance.PendingIn = balance.PendingIn.Add(pendingIn.Amount)
+				// 如果没有UTXO，从PendingIn获取Tick名称
+				if balance.Tick == "" {
+					balance.Tick = pendingIn.Tick
+				}
 			}
 		}
 	}
 
-	// 3. 计算总额
+	// 3. 如果Tick名称仍然为空（没有UTXO也没有PendingIn中的Tick），从deploy信息获取
+	if balance.Tick == "" {
+		tickInfo, err := PebbleStore.GetMrc20TickInfo(tickId, "")
+		if err == nil {
+			balance.Tick = tickInfo.Tick
+		} else {
+			log.Printf("[Balance] Warning: unable to get tick name for tickId=%s: %v", tickId, err)
+		}
+	}
+
+	// 4. 计算总额
 	balance.Total = balance.Balance.Add(balance.PendingOut).Add(balance.PendingIn)
 
 	log.Printf("[Balance] Calculated from UTXO: chain=%s, address=%s, tick=%s, balance=%s, pendingOut=%s, pendingIn=%s, utxos=%d",
@@ -146,9 +166,10 @@ type MRC20Balance struct {
 
 // GetAddressBalances 获取某个地址的所有代币余额（基于UTXO实时计算）
 func GetAddressBalances(chain, address string) ([]*MRC20Balance, error) {
-	// 先获取该地址持有的所有tickId（通过扫描UTXO）
+	// 先获取该地址持有的所有tickId（通过扫描UTXO + PendingIn）
 	tickMap := make(map[string]bool)
 
+	// 1. 扫描UTXO
 	prefix := []byte(fmt.Sprintf("mrc20_utxo_"))
 	iter, err := PebbleStore.Database.MrcDb.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
@@ -169,6 +190,26 @@ func GetAddressBalances(chain, address string) ([]*MRC20Balance, error) {
 			// 只统计非Spent的UTXO
 			if utxo.Status != mrc20.UtxoStatusSpent {
 				tickMap[utxo.Mrc20Id] = true
+			}
+		}
+	}
+
+	// 2. 扫描 TeleportPendingIn（接收方可能没有UTXO，只有PendingIn）
+	teleportPendingIns, err := PebbleStore.GetTeleportPendingInByAddress(address)
+	if err == nil {
+		for _, pendingIn := range teleportPendingIns {
+			if pendingIn.Chain == chain {
+				tickMap[pendingIn.TickId] = true
+			}
+		}
+	}
+
+	// 3. 扫描 TransferPendingIn（同理）
+	transferPendingIns, err := PebbleStore.GetTransferPendingInByAddress(address)
+	if err == nil {
+		for _, pendingIn := range transferPendingIns {
+			if pendingIn.Chain == chain {
+				tickMap[pendingIn.TickId] = true
 			}
 		}
 	}

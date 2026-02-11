@@ -23,38 +23,38 @@ const (
 // 使用状态机管理整个teleport生命周期，确保原子性和幂等性
 type TeleportTransaction struct {
 	// 基本信息
-	ID             string          `json:"id"`              // 唯一ID: hash(coord + sourceTxId)
-	Coord          string          `json:"coord"`           // Arrival coord (pinId)
-	SourceChain    string          `json:"sourceChain"`     // 源链（btc/doge/mvc）
-	TargetChain    string          `json:"targetChain"`     // 目标链
-	SourceTxId     string          `json:"sourceTxId"`      // 源链transfer交易ID
-	SourcePinId    string          `json:"sourcePinId"`     // 源链transfer PIN ID
-	SourceOutpoint string          `json:"sourceOutpoint"`  // 源UTXO txpoint
-	TargetOutpoint string          `json:"targetOutpoint"`  // 目标UTXO txpoint（创建后填充）
-	Amount         decimal.Decimal `json:"amount"`          // 转移金额
-	TickId         string          `json:"tickId"`          // 代币ID
-	Tick           string          `json:"tick"`            // 代币名称
-	FromAddress    string          `json:"fromAddress"`     // 发送方地址
-	ToAddress      string          `json:"toAddress"`       // 接收方地址
-	AssetOutpoint  string          `json:"assetOutpoint"`   // Arrival声明的资产outpoint（用于验证）
+	ID             string          `json:"id"`             // 唯一ID: hash(coord + sourceTxId)
+	Coord          string          `json:"coord"`          // Arrival coord (pinId)
+	SourceChain    string          `json:"sourceChain"`    // 源链（btc/doge/mvc）
+	TargetChain    string          `json:"targetChain"`    // 目标链
+	SourceTxId     string          `json:"sourceTxId"`     // 源链transfer交易ID
+	SourcePinId    string          `json:"sourcePinId"`    // 源链transfer PIN ID
+	SourceOutpoint string          `json:"sourceOutpoint"` // 源UTXO txpoint
+	TargetOutpoint string          `json:"targetOutpoint"` // 目标UTXO txpoint（创建后填充）
+	Amount         decimal.Decimal `json:"amount"`         // 转移金额
+	TickId         string          `json:"tickId"`         // 代币ID
+	Tick           string          `json:"tick"`           // 代币名称
+	FromAddress    string          `json:"fromAddress"`    // 发送方地址
+	ToAddress      string          `json:"toAddress"`      // 接收方地址
+	AssetOutpoint  string          `json:"assetOutpoint"`  // Arrival声明的资产outpoint（用于验证）
 
 	// 状态管理
-	State          int                    `json:"state"`          // 当前状态
-	StateHistory   []TeleportStateChange  `json:"stateHistory"`   // 状态变更历史
-	FailureReason  string                 `json:"failureReason"`  // 失败原因
-	RetryCount     int                    `json:"retryCount"`     // 重试次数
-	LastRetryAt    int64                  `json:"lastRetryAt"`    // 最后重试时间
+	State         int                   `json:"state"`         // 当前状态
+	StateHistory  []TeleportStateChange `json:"stateHistory"`  // 状态变更历史
+	FailureReason string                `json:"failureReason"` // 失败原因
+	RetryCount    int                   `json:"retryCount"`    // 重试次数
+	LastRetryAt   int64                 `json:"lastRetryAt"`   // 最后重试时间
 
 	// 时间戳
-	CreatedAt      int64 `json:"createdAt"`      // 创建时间
-	UpdatedAt      int64 `json:"updatedAt"`      // 更新时间
-	CompletedAt    int64 `json:"completedAt"`    // 完成时间
+	CreatedAt         int64 `json:"createdAt"`         // 创建时间
+	UpdatedAt         int64 `json:"updatedAt"`         // 更新时间
+	CompletedAt       int64 `json:"completedAt"`       // 完成时间
 	SourceBlockHeight int64 `json:"sourceBlockHeight"` // 源链区块高度
 	TargetBlockHeight int64 `json:"targetBlockHeight"` // 目标链区块高度
 
 	// 锁定信息
-	LockedBy       string `json:"lockedBy"`       // 锁定者（进程ID或节点ID）
-	LockExpiresAt  int64  `json:"lockExpiresAt"`  // 锁过期时间
+	LockedBy      string `json:"lockedBy"`      // 锁定者（进程ID或节点ID）
+	LockExpiresAt int64  `json:"lockExpiresAt"` // 锁过期时间
 }
 
 // TeleportStateChange 状态变更记录
@@ -228,4 +228,21 @@ func (tx *TeleportTransaction) ReleaseLock(processID string) {
 		tx.LockedBy = ""
 		tx.LockExpiresAt = 0
 	}
+}
+
+// PendingTeleport 等待配对的 Teleport Transfer
+// 当 Transfer 或 Arrival 任意一方先到达时，保存到 Pending 队列等待配对
+type PendingTeleport struct {
+	Coord       string                    `json:"coord"`       // Arrival coord (pinId)
+	Type        string                    `json:"type"`        // "transfer" or "arrival" - 标识是哪一方先到达
+	SourceTxId  string                    `json:"sourceTxId"`  // 源链transfer交易ID
+	SourcePinId string                    `json:"sourcePinId"` // 源链transfer PIN ID
+	SourceChain string                    `json:"sourceChain"` // 源链
+	TargetChain string                    `json:"targetChain"` // 目标链
+	Data        Mrc20TeleportTransferData `json:"data"`        // Transfer数据
+	PinNodeJson string                    `json:"pinNodeJson"` // PinInscription序列化JSON（用于重新处理）
+	CreatedAt   int64                     `json:"createdAt"`   // 创建时间
+	ExpireAt    int64                     `json:"expireAt"`    // 过期时间（超时后清理）
+	RetryCount  int                       `json:"retryCount"`  // 重试次数
+	LastCheckAt int64                     `json:"lastCheckAt"` // 最后检查时间
 }
