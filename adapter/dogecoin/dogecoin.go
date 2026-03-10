@@ -306,7 +306,7 @@ func parseDogeBlockTransactions(blockBytes []byte, expectedTxCount int) ([]*wire
 	if version&0x100 != 0 {
 		// Skip AuxPoW data
 		// AuxPoW structure:
-		// - coinbase tx (variable)
+		// - coinbase tx (variable, may be SegWit from parent chain like Bitcoin/Litecoin)
 		// - block hash (32 bytes)
 		// - merkle branch (varint count + 32*count bytes)
 		// - merkle index (4 bytes)
@@ -314,33 +314,75 @@ func parseDogeBlockTransactions(blockBytes []byte, expectedTxCount int) ([]*wire
 		// - aux merkle index (4 bytes)
 		// - parent block header (80 bytes)
 
-		// Parse coinbase transaction
+		// Parse coinbase transaction using WitnessEncoding because the parent chain
+		// (typically Bitcoin or Litecoin) may use SegWit. Using BaseEncoding on a
+		// SegWit tx interprets the 0x00 marker as "0 inputs", consuming far fewer
+		// bytes and corrupting all subsequent offset calculations.
 		coinbaseTx := &wire.MsgTx{}
 		r := bytes.NewReader(blockBytes[offset:])
-		if err := coinbaseTx.BtcDecode(r, 0, wire.BaseEncoding); err != nil {
-			return nil, fmt.Errorf("failed to parse AuxPoW coinbase: %v", err)
+		if err := coinbaseTx.BtcDecode(r, 0, wire.WitnessEncoding); err != nil {
+			// Fall back to BaseEncoding for non-SegWit parent chains
+			r = bytes.NewReader(blockBytes[offset:])
+			if err2 := coinbaseTx.BtcDecode(r, 0, wire.BaseEncoding); err2 != nil {
+				return nil, fmt.Errorf("failed to parse AuxPoW coinbase: witness=%v base=%v", err, err2)
+			}
 		}
 		offset += len(blockBytes[offset:]) - r.Len()
 
 		// Skip block hash (32 bytes)
+		if offset+32 > len(blockBytes) {
+			return nil, fmt.Errorf("AuxPoW block too short for block hash at offset %d (len=%d)", offset, len(blockBytes))
+		}
 		offset += 32
 
 		// Skip merkle branch
+		if offset >= len(blockBytes) {
+			return nil, fmt.Errorf("AuxPoW block too short for merkle branch at offset %d (len=%d)", offset, len(blockBytes))
+		}
 		branchCount, n := readVarInt(blockBytes[offset:])
+		if branchCount > 256 {
+			return nil, fmt.Errorf("AuxPoW merkle branch count implausibly large: %d (offset=%d)", branchCount, offset)
+		}
+		if offset+n+int(branchCount)*32 > len(blockBytes) {
+			return nil, fmt.Errorf("AuxPoW block too short for merkle branches at offset %d (count=%d, len=%d)", offset, branchCount, len(blockBytes))
+		}
 		offset += n + int(branchCount)*32
 
 		// Skip merkle index (4 bytes)
+		if offset+4 > len(blockBytes) {
+			return nil, fmt.Errorf("AuxPoW block too short for merkle index at offset %d (len=%d)", offset, len(blockBytes))
+		}
 		offset += 4
 
 		// Skip aux merkle branch
+		if offset >= len(blockBytes) {
+			return nil, fmt.Errorf("AuxPoW block too short for aux merkle branch at offset %d (len=%d)", offset, len(blockBytes))
+		}
 		auxBranchCount, n := readVarInt(blockBytes[offset:])
+		if auxBranchCount > 256 {
+			return nil, fmt.Errorf("AuxPoW aux merkle branch count implausibly large: %d (offset=%d)", auxBranchCount, offset)
+		}
+		if offset+n+int(auxBranchCount)*32 > len(blockBytes) {
+			return nil, fmt.Errorf("AuxPoW block too short for aux merkle branches at offset %d (count=%d, len=%d)", offset, auxBranchCount, len(blockBytes))
+		}
 		offset += n + int(auxBranchCount)*32
 
 		// Skip aux merkle index (4 bytes)
+		if offset+4 > len(blockBytes) {
+			return nil, fmt.Errorf("AuxPoW block too short for aux merkle index at offset %d (len=%d)", offset, len(blockBytes))
+		}
 		offset += 4
 
 		// Skip parent block header (80 bytes)
+		if offset+80 > len(blockBytes) {
+			return nil, fmt.Errorf("AuxPoW block too short for parent header at offset %d (len=%d)", offset, len(blockBytes))
+		}
 		offset += 80
+	}
+
+	// Bounds check before reading transaction count
+	if offset >= len(blockBytes) {
+		return nil, fmt.Errorf("block too short for tx count at offset %d (len=%d)", offset, len(blockBytes))
 	}
 
 	// Now we're at the transaction count varint
