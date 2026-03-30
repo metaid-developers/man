@@ -91,7 +91,7 @@ func pinList(ctx *gin.Context) {
 			Id: p.Id, Type: p.ContentTypeDetect, Path: p.Path, MetaId: p.MetaId,
 			Pop: p.Pop, ChainName: p.ChainName,
 			InitialOwner: p.InitialOwner, Address: p.Address, CreateAddress: p.CreateAddress,
-			Timestamp: p.Timestamp,
+			Timestamp: p.Timestamp, SeenTime: p.SeenTime,
 		}
 		msg = append(msg, pmsg)
 	}
@@ -127,6 +127,7 @@ func mempoolList(ctx *gin.Context) {
 			Path:      p.Path,
 			MetaId:    p.MetaId,
 			Timestamp: p.Timestamp,
+			SeenTime:  p.SeenTime,
 		}
 		msg = append(msg, pmsg)
 	}
