@@ -1,7 +1,12 @@
 man_base_data_pebble/
+data_test/
+pebble_data/
 manindexer
 .vscode/
 metaid_cli/metaid-cli
 idaddress/idaddress.test
 idaddress/cmd/idaddr/idaddr
 mrc20_migration
+config_local*.toml
+idaddress/cmd/mvckey/keypair.txt
+idaddress/cmd/mvckey/test_account_*.json

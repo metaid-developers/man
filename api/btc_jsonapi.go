@@ -61,6 +61,8 @@ func metaidList(ctx *gin.Context) {
 		ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{"list": list, "count": 0}))
 		return
 	}
+	sortParams := parseSortParams(ctx, "number")
+	sortMetaIdInfoList(list, sortParams)
 	count := man.PebbleStore.GetAllCount().MetaId
 	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{"list": list, "count": count}))
 }
@@ -93,6 +95,8 @@ func pinList(ctx *gin.Context) {
 		}
 		msg = append(msg, pmsg)
 	}
+	sortParams := parseSortParams(ctx, "timestamp")
+	sortPinMsgList(msg, sortParams)
 	count := man.PebbleStore.GetAllCount()
 	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{"Pins": msg, "Count": &count, "Active": "index", "LastId": lastId}))
 }
@@ -114,9 +118,20 @@ func mempoolList(ctx *gin.Context) {
 	}
 	var msg []*pin.PinMsg
 	for _, p := range list {
-		pmsg := &pin.PinMsg{Content: p.ContentSummary, Number: p.Number, Operation: p.Operation, Id: p.Id, Type: p.ContentTypeDetect, Path: p.Path, MetaId: p.MetaId}
+		pmsg := &pin.PinMsg{
+			Content:   p.ContentSummary,
+			Number:    p.Number,
+			Operation: p.Operation,
+			Id:        p.Id,
+			Type:      p.ContentTypeDetect,
+			Path:      p.Path,
+			MetaId:    p.MetaId,
+			Timestamp: p.Timestamp,
+		}
 		msg = append(msg, pmsg)
 	}
+	sortParams := parseSortParams(ctx, "timestamp")
+	sortPinMsgList(msg, sortParams)
 	count := man.PebbleStore.GetAllCount()
 	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{"Pins": msg, "Count": &count, "Active": "mempool"}))
 }
@@ -213,6 +228,8 @@ func getPinListByAddress(ctx *gin.Context) {
 		pinNode.PopLv, _ = pin.PopLevelCount(pinNode.ChainName, pinNode.Pop)
 		fixPinList = append(fixPinList, pinNode)
 	}
+	sortParams := parseSortParams(ctx, "timestamp")
+	sortPinInscriptionList(fixPinList, sortParams)
 	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{"list": fixPinList, "total": total, "nextCursor": nextCursor}))
 }
 
@@ -275,6 +292,8 @@ func getAllPinByPath(ctx *gin.Context) {
 		ctx.JSON(http.StatusOK, respond.ErrNoPinFound)
 		return
 	}
+	sortParams := parseSortParams(ctx, "timestamp")
+	sortPinInscriptionList(pinList1, sortParams)
 	// Return list, total count, and next page cursor
 	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{"list": pinList1, "total": total, "nextCursor": nextCursor}))
 }
@@ -330,6 +349,8 @@ func getAllPinByPathAndMetaId(ctx *gin.Context) {
 		pinNode.PopLv, _ = pin.PopLevelCount(pinNode.ChainName, pinNode.Pop)
 		fixPinList = append(fixPinList, pinNode)
 	}
+	sortParams := parseSortParams(ctx, "timestamp")
+	sortPinInscriptionList(fixPinList, sortParams)
 	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{"list": fixPinList, "total": total, "nextCursor": nextCursor}))
 }
 
@@ -352,6 +373,8 @@ func notifcationList(ctx *gin.Context) {
 		ctx.JSON(http.StatusOK, respond.ErrServiceError)
 		return
 	}
+	sortParams := parseSortParams(ctx, "notifcationtime")
+	sortNotifcationList(list, sortParams)
 
 	ctx.JSON(http.StatusOK, gin.H{"code": 200, "message": "ok", "data": list, "total": total})
 }

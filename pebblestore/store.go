@@ -1,6 +1,7 @@
 package pebblestore
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"manindexer/common"
@@ -341,11 +342,42 @@ func (idx *Database) InsertPinSort(db *pebble.DB, sortLsit []string) error {
 
 // InsertBlockTxs 插入区块交易表
 func (idx *Database) InsertBlockTxs(blockKey string, data string) error {
-	return idx.BlocksDB.Set([]byte(blockKey), []byte(data), pebble.Sync)
+	if err := idx.BlocksDB.Set([]byte(blockKey), []byte(data), pebble.Sync); err != nil {
+		return err
+	}
+	arr := strings.Split(blockKey, "&")
+	if len(arr) >= 3 {
+		height, err := strconv.Atoi(arr[2])
+		if err == nil {
+			indexKey := buildBlockIndexKey(arr[1], height)
+			if err := idx.MetaDb.Set([]byte(indexKey), []byte(data), pebble.Sync); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func buildBlockIndexKey(chainName string, height int) string {
+	chainName = strings.ToLower(strings.TrimSpace(chainName))
+	return "block_idx_" + chainName + "_" + strconv.Itoa(height)
 }
 
 // 获取BlocksDB所有的数据
 func (idx *Database) GetlBlocksDB(chainName string, height int) (*string, error) {
+	chainName = strings.ToLower(strings.TrimSpace(chainName))
+	if chainName == "" || height < 0 {
+		return nil, nil
+	}
+	indexKey := buildBlockIndexKey(chainName, height)
+	if val, closer, err := idx.MetaDb.Get([]byte(indexKey)); err == nil {
+		blockVal := string(val)
+		closer.Close()
+		return &blockVal, nil
+	} else if err != nil && !errors.Is(err, pebble.ErrNotFound) {
+		return nil, err
+	}
+
 	it, err := idx.BlocksDB.NewIter(nil)
 	if err != nil {
 		return nil, err
@@ -356,6 +388,8 @@ func (idx *Database) GetlBlocksDB(chainName string, height int) (*string, error)
 		key := string(it.Key())
 		if strings.Contains(key, searchKey) {
 			val := string(it.Value())
+			// 首次命中时回填索引，后续可 O(1) 读取。
+			_ = idx.MetaDb.Set([]byte(indexKey), []byte(val), pebble.Sync)
 			return &val, nil
 		}
 	}

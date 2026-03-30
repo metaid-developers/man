@@ -8,7 +8,6 @@ import (
 	"manindexer/man"
 	"manindexer/mrc20"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -84,6 +83,8 @@ func allTick(ctx *gin.Context) {
 		ctx.JSON(http.StatusOK, respond.ErrNoDataFound)
 		return
 	}
+	sortParams := parseSortParams(ctx, "deploytime")
+	sortMrc20DeployInfoList(list, sortParams)
 	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{"list": list, "total": len(list)}))
 }
 func getTickInfoById(ctx *gin.Context) {
@@ -142,6 +143,8 @@ func getHistoryByAddress(ctx *gin.Context) {
 		ctx.JSON(http.StatusOK, respond.ErrNoDataFound)
 		return
 	}
+	sortParams := parseSortParams(ctx, "timestamp")
+	sortMrc20UtxoList(list, sortParams)
 	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{"list": list, "total": total}))
 }
 func getHistoryById(ctx *gin.Context) {
@@ -162,6 +165,8 @@ func getHistoryById(ctx *gin.Context) {
 		ctx.JSON(http.StatusOK, respond.ErrNoDataFound)
 		return
 	}
+	sortParams := parseSortParams(ctx, "timestamp")
+	sortMrc20TransactionList(list, sortParams)
 	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{"list": list, "total": total}))
 }
 
@@ -224,10 +229,8 @@ func getBalanceByAddress(ctx *gin.Context) {
 		})
 	}
 
-	// 排序（按 tickId）
-	sort.Slice(apiBalances, func(i, j int) bool {
-		return apiBalances[i].Id < apiBalances[j].Id
-	})
+	sortParams := parseSortParams(ctx, "id")
+	sortMrc20BalanceList(apiBalances, sortParams)
 
 	// 分页
 	total := int64(len(apiBalances))
@@ -269,6 +272,8 @@ func getHistoryByTx(ctx *gin.Context) {
 			ctx.JSON(http.StatusOK, respond.ErrNoDataFound)
 			return
 		}
+		sortParams := parseSortParams(ctx, "timestamp")
+		sortMrc20UtxoList([]*mrc20.Mrc20Utxo{utxo}, sortParams)
 		ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{"list": []*mrc20.Mrc20Utxo{utxo}, "total": 1}))
 	} else {
 		// 如果没有指定 index，返回该交易的所有 UTXO
@@ -277,6 +282,8 @@ func getHistoryByTx(ctx *gin.Context) {
 			ctx.JSON(http.StatusOK, respond.ErrNoDataFound)
 			return
 		}
+		sortParams := parseSortParams(ctx, "timestamp")
+		sortMrc20UtxoList(utxos, sortParams)
 		ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{"list": utxos, "total": len(utxos)}))
 	}
 }
@@ -303,6 +310,8 @@ func getAddressHistoryByTickAndAddress(ctx *gin.Context) {
 		ctx.JSON(http.StatusOK, respond.ErrNoDataFound)
 		return
 	}
+	sortParams := parseSortParams(ctx, "timestamp")
+	sortMrc20TransactionList(list, sortParams)
 	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{"list": list, "total": total}))
 }
 

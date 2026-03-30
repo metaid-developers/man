@@ -20,6 +20,8 @@ func listTeleportTransactionsV2(ctx *gin.Context) {
 		ctx.JSON(http.StatusOK, respond.ApiError(0, err.Error()))
 		return
 	}
+	sortParams := parseSortParams(ctx, "createdat")
+	sortTeleportTransactionList(txs, sortParams)
 
 	ctx.JSON(http.StatusOK, respond.ApiSuccess(1, "ok", gin.H{
 		"list":  txs,

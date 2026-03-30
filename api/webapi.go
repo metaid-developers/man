@@ -19,6 +19,7 @@ import (
 	_ "manindexer/docs"
 
 	"github.com/btcsuite/btcd/btcutil"
+	"github.com/cockroachdb/pebble"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
@@ -120,6 +121,7 @@ func Start(f embed.FS) {
 	r.GET("/stream/:number", stream)
 	//debug api
 	r.GET("/debug/count", debugCount)
+	r.GET("/debug/sync", debugSync)
 	//mrc20 - 注意：更具体的路由要放在前面
 	r.GET("/mrc20/info/:id", mrc20Info)
 	r.GET("/mrc20/holders/:id/:page", mrc20Holders)
@@ -148,9 +150,13 @@ func Start(f embed.FS) {
 	// }()
 	log.Println("Server Start", common.Config.Web.Port)
 	if common.Config.Web.KeyFile != "" && common.Config.Web.PemFile != "" {
-		r.RunTLS(common.Config.Web.Port, common.Config.Web.PemFile, common.Config.Web.KeyFile)
+		if err := r.RunTLS(common.Config.Web.Port, common.Config.Web.PemFile, common.Config.Web.KeyFile); err != nil {
+			log.Printf("Server Start failed: %v", err)
+		}
 	} else {
-		r.Run(common.Config.Web.Port)
+		if err := r.Run(common.Config.Web.Port); err != nil {
+			log.Printf("Server Start failed: %v", err)
+		}
 	}
 
 }
@@ -164,6 +170,41 @@ func debugCount(ctx *gin.Context) {
 		"metaId": count.MetaId,
 		"app":    count.App,
 	})
+}
+
+// debugSync - Debug API that returns sync heights from MetaDB
+func debugSync(ctx *gin.Context) {
+	db := man.PebbleStore.Database
+	if db == nil || db.MetaDb == nil {
+		ctx.JSON(500, gin.H{"error": "db not ready"})
+		return
+	}
+
+	keys := []string{
+		"mvc_sync_height",
+		"btc_sync_height",
+		"doge_sync_height",
+		"mvc_mrc20_sync_height",
+		"btc_mrc20_sync_height",
+		"doge_mrc20_sync_height",
+	}
+
+	result := make(map[string]interface{}, len(keys))
+	for _, key := range keys {
+		val, closer, err := db.MetaDb.Get([]byte(key))
+		if err == nil {
+			result[key] = string(val)
+			closer.Close()
+			continue
+		}
+		if err == pebble.ErrNotFound {
+			result[key] = nil
+			continue
+		}
+		result[key] = fmt.Sprintf("error: %v", err)
+	}
+
+	ctx.JSON(200, result)
 }
 
 // index page

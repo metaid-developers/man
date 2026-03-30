@@ -23,7 +23,11 @@ type PebbleData struct {
 }
 
 func (pd *PebbleData) Init(shardNum int) (err error) {
-	dbPath := filepath.Join("./man_base_data_pebble")
+	dbPath := strings.TrimSpace(common.Config.Pebble.Dir)
+	if dbPath == "" {
+		dbPath = "./man_base_data_pebble"
+	}
+	dbPath = filepath.Clean(dbPath)
 	err = os.MkdirAll(dbPath, 0755)
 	if err != nil {
 		return

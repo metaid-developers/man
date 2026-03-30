@@ -37,7 +37,7 @@ func main() {
 	if common.Config.Sync.Mrc20Only {
 		modeInfo = ",mode=MRC20-ONLY"
 	}
-	log.Printf("ManIndex,chain=%s,fullnode=%v,test=%s,db=%s,server=%s,config=%s%s", common.Chain, common.Config.Sync.IsFullNode, common.TestNet, common.Db, common.Server, common.ConfigFile, modeInfo)
+	log.Printf("ManIndex,chain=%s,fullnode=%v,test=%s,db=%s,server=%s,config=%s%s,metaChain=%s", common.Chain, common.Config.Sync.IsFullNode, common.TestNet, common.Db, common.Server, common.ConfigFile, modeInfo, common.Config.Statistics.MetaChainHost)
 
 	if common.Server == "1" {
 		go api.Start(f)
@@ -47,12 +47,13 @@ func main() {
 	// 首次启动时先执行 MRC20 补索引，确保 MRC20 进度追上主索引
 	man.Mrc20CatchUpRun()
 
+	// Execute statistics（MRC20 Only 模式下跳过），只启动一次避免 goroutine 堆积
+	if !common.Config.Sync.Mrc20Only {
+		go pebblestore.StatMetaId(man.PebbleStore.Database)
+		go pebblestore.StatPinSort(man.PebbleStore.Database)
+	}
+
 	for {
-		// Execute statistics（MRC20 Only 模式下跳过）
-		if !common.Config.Sync.Mrc20Only {
-			go pebblestore.StatMetaId(man.PebbleStore.Database)
-			go pebblestore.StatPinSort(man.PebbleStore.Database)
-		}
 		man.IndexerRun(common.TestNet)
 
 		// 每轮主索引后再次检查是否需要补索引

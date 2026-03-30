@@ -34,7 +34,22 @@ var (
 	IsTestNet      bool = false
 	PebbleStore    *PebbleData
 	ChainList      []string // 保持链的顺序
+	mempoolTaskSem chan struct{}
 )
+
+func runMempoolTask(task func()) {
+	if mempoolTaskSem == nil {
+		task()
+		return
+	}
+	mempoolTaskSem <- struct{}{}
+	go func() {
+		defer func() {
+			<-mempoolTaskSem
+		}()
+		task()
+	}()
+}
 
 // InitAdapter 初始化区块链适配器
 func InitAdapter(chainType, dbType, test, server string) {
@@ -49,6 +64,7 @@ func InitAdapter(chainType, dbType, test, server string) {
 	ProtocolsFilter = make(map[string]struct{})
 	SyncBaseFilter = make(map[string]struct{})
 	BarMap = make(map[string]*progressbar.ProgressBar)
+	mempoolTaskSem = make(chan struct{}, 256)
 	syncConfig := common.Config.Sync
 	if len(syncConfig.SyncProtocols) > 0 {
 		for _, f := range BaseFilter {
@@ -130,8 +146,13 @@ func doZmqRun(chain string, indexer adapter.Indexer) {
 				continue
 			}
 			// go handleUserInfo(pinNode)
-			go handleMempoolPin(pinNode)
-			go handleMetaIdInfo(&[]*pin.PinInscription{pinNode})
+			node := pinNode
+			runMempoolTask(func() {
+				handleMempoolPin(node)
+			})
+			runMempoolTask(func() {
+				handleMetaIdInfo(&[]*pin.PinInscription{node})
+			})
 			// if !pinNode.IsTransfered {
 			// 	handleMempoolPin(pinNode)
 			// } else if pinNode.IsTransfered {
