@@ -216,8 +216,8 @@ func (indexer *Indexer) CatchPins(blockHeight int64) (pinInscriptions *[]*pin.Pi
 }
 func (indexer *Indexer) CatchMempoolPins(txList []interface{}) (pinInscriptions []*pin.PinInscription, txInList []string) {
 	timestamp := time.Now().Unix()
-	blockHash := "none"
-	merkleRoot := "none"
+	blockHash := ""
+	merkleRoot := ""
 	for i, item := range txList {
 		tx := item.(*wire.MsgTx)
 		for _, in := range tx.TxIn {

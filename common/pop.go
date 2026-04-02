@@ -15,10 +15,22 @@ func CalculateHash(pinid string, merkleRoot string) string {
 }
 
 func CalculateProductToHexStr(blockhash string, pinHash string) string {
-	blockhashByte, _ := hex.DecodeString(blockhash)
-	blockhashInt, _ := new(big.Int).SetString(blockhash, 16)
-	pinHashByte, _ := hex.DecodeString(pinHash)
-	pinHashInt, _ := new(big.Int).SetString(pinHash, 16)
+	blockhashByte, err := hex.DecodeString(blockhash)
+	if err != nil {
+		return ""
+	}
+	blockhashInt, ok := new(big.Int).SetString(blockhash, 16)
+	if !ok {
+		return ""
+	}
+	pinHashByte, err := hex.DecodeString(pinHash)
+	if err != nil {
+		return ""
+	}
+	pinHashInt, ok := new(big.Int).SetString(pinHash, 16)
+	if !ok {
+		return ""
+	}
 	popByte := new(big.Int).Mul(blockhashInt, pinHashInt).Bytes()
 	//calculate the total number of digits:32+32=64
 	totalLen := len(blockhashByte) + len(pinHashByte)
@@ -71,6 +83,9 @@ func GenPop(pinid, merkleRoot, blockHash string) (string, int64) {
 	pinHash := CalculateHash(pinid, merkleRoot)
 	//blockhash * pinHash
 	productHexStr := CalculateProductToHexStr(blockHash, pinHash)
+	if productHexStr == "" {
+		return "", 0
+	}
 	//convert to octal
 	octal, bCount := ConvertToOctalHex(productHexStr)
 	return octal, bCount
